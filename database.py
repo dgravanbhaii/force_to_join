@@ -4,6 +4,10 @@ from typing import List, Tuple
 DB_NAME = "forcejoin.db"
 
 
+# ============================================================
+# CONNECTION
+# ============================================================
+
 def get_connection():
     conn = sqlite3.connect(DB_NAME)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -18,7 +22,15 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Existing users
+    # --------------------------------------------------------
+    # USERS
+    # approved values:
+    # 0 = PENDING
+    # 1 = APPROVED
+    # 2 = REJECTED
+    # 3 = REVOKED
+    # --------------------------------------------------------
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -29,7 +41,19 @@ def init_db():
         )
     """)
 
-    # Existing channels
+    # Existing database migration
+    # Make sure old users still work.
+    try:
+        cursor.execute(
+            "ALTER TABLE users ADD COLUMN username TEXT"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    # --------------------------------------------------------
+    # CHANNELS
+    # --------------------------------------------------------
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,7 +63,10 @@ def init_db():
         )
     """)
 
-    # Group settings
+    # --------------------------------------------------------
+    # GROUP SETTINGS
+    # --------------------------------------------------------
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS group_settings (
             chat_id INTEGER PRIMARY KEY,
@@ -52,7 +79,10 @@ def init_db():
         )
     """)
 
-    # Warnings
+    # --------------------------------------------------------
+    # WARNINGS
+    # --------------------------------------------------------
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS warnings (
             chat_id INTEGER NOT NULL,
@@ -62,7 +92,10 @@ def init_db():
         )
     """)
 
-    # Locks
+    # --------------------------------------------------------
+    # LOCKS
+    # --------------------------------------------------------
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS locks (
             chat_id INTEGER NOT NULL,
@@ -72,7 +105,10 @@ def init_db():
         )
     """)
 
-    # Federation
+    # --------------------------------------------------------
+    # FEDERATION
+    # --------------------------------------------------------
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS federations (
             fed_id TEXT PRIMARY KEY,
@@ -122,11 +158,14 @@ def init_db():
 # USERS
 # ============================================================
 
-def add_user(user_id: int, first_name: str, username: str):
+def add_user(
+    user_id: int,
+    first_name: str,
+    username: str,
+):
     conn = get_connection()
-    cursor = conn.cursor()
 
-    cursor.execute("""
+    conn.execute("""
         INSERT INTO users (
             user_id,
             first_name,
@@ -147,8 +186,56 @@ def add_user(user_id: int, first_name: str, username: str):
     conn.close()
 
 
-def set_verified(user_id: int, verified: bool = True):
+def get_user(user_id: int):
     conn = get_connection()
+
+    result = conn.execute("""
+        SELECT
+            user_id,
+            first_name,
+            username,
+            verified,
+            approved
+        FROM users
+        WHERE user_id = ?
+    """, (user_id,)).fetchone()
+
+    conn.close()
+
+    return result
+
+
+def get_user_by_username(username: str):
+    username = username.strip().lstrip("@").lower()
+
+    conn = get_connection()
+
+    result = conn.execute("""
+        SELECT
+            user_id,
+            first_name,
+            username,
+            verified,
+            approved
+        FROM users
+        WHERE LOWER(username) = ?
+    """, (username,)).fetchone()
+
+    conn.close()
+
+    return result
+
+
+# ============================================================
+# VERIFIED
+# ============================================================
+
+def set_verified(
+    user_id: int,
+    verified: bool = True,
+):
+    conn = get_connection()
+
     conn.execute("""
         UPDATE users
         SET verified = ?
@@ -157,12 +244,14 @@ def set_verified(user_id: int, verified: bool = True):
         1 if verified else 0,
         user_id,
     ))
+
     conn.commit()
     conn.close()
 
 
 def is_verified(user_id: int) -> bool:
     conn = get_connection()
+
     result = conn.execute("""
         SELECT verified
         FROM users
@@ -175,10 +264,20 @@ def is_verified(user_id: int) -> bool:
 
 
 # ============================================================
-# APPROVAL
+# APPROVAL STATUS
 # ============================================================
 
-def set_approval(user_id: int, status: int):
+def set_approval(
+    user_id: int,
+    status: int,
+):
+    """
+    0 = Pending
+    1 = Approved
+    2 = Rejected
+    3 = Revoked
+    """
+
     conn = get_connection()
 
     conn.execute("""
@@ -194,7 +293,10 @@ def set_approval(user_id: int, status: int):
     conn.close()
 
 
-def get_approval_status(user_id: int) -> int:
+def get_approval_status(
+    user_id: int,
+) -> int:
+
     conn = get_connection()
 
     result = conn.execute("""
@@ -208,29 +310,94 @@ def get_approval_status(user_id: int) -> int:
     if not result:
         return 0
 
-    return result[0]
+    return int(result[0])
 
 
-def is_approved(user_id: int) -> bool:
+def is_approved(
+    user_id: int,
+) -> bool:
     return get_approval_status(user_id) == 1
 
 
+def get_status_name(
+    status: int,
+) -> str:
+
+    names = {
+        0: "PENDING",
+        1: "APPROVED",
+        2: "REJECTED",
+        3: "REVOKED",
+    }
+
+    return names.get(status, "UNKNOWN")
+
+
+# ============================================================
+# APPROVAL USERS
+# ============================================================
+
 def get_pending_users():
+
     conn = get_connection()
 
     users = conn.execute("""
-        SELECT user_id, first_name, username
+        SELECT
+            user_id,
+            first_name,
+            username
         FROM users
         WHERE approved = 0
         ORDER BY user_id DESC
     """).fetchall()
 
     conn.close()
+
+    return users
+
+
+def get_rejected_users():
+
+    conn = get_connection()
+
+    users = conn.execute("""
+        SELECT
+            user_id,
+            first_name,
+            username
+        FROM users
+        WHERE approved = 2
+        ORDER BY user_id DESC
+    """).fetchall()
+
+    conn.close()
+
+    return users
+
+
+def get_revoked_users():
+
+    conn = get_connection()
+
+    users = conn.execute("""
+        SELECT
+            user_id,
+            first_name,
+            username
+        FROM users
+        WHERE approved = 3
+        ORDER BY user_id DESC
+    """).fetchall()
+
+    conn.close()
+
     return users
 
 
 def get_pending_count() -> int:
+
     conn = get_connection()
+
     count = conn.execute("""
         SELECT COUNT(*)
         FROM users
@@ -238,11 +405,14 @@ def get_pending_count() -> int:
     """).fetchone()[0]
 
     conn.close()
+
     return count
 
 
 def get_approved_count() -> int:
+
     conn = get_connection()
+
     count = conn.execute("""
         SELECT COUNT(*)
         FROM users
@@ -250,6 +420,37 @@ def get_approved_count() -> int:
     """).fetchone()[0]
 
     conn.close()
+
+    return count
+
+
+def get_rejected_count() -> int:
+
+    conn = get_connection()
+
+    count = conn.execute("""
+        SELECT COUNT(*)
+        FROM users
+        WHERE approved = 2
+    """).fetchone()[0]
+
+    conn.close()
+
+    return count
+
+
+def get_revoked_count() -> int:
+
+    conn = get_connection()
+
+    count = conn.execute("""
+        SELECT COUNT(*)
+        FROM users
+        WHERE approved = 3
+    """).fetchone()[0]
+
+    conn.close()
+
     return count
 
 
@@ -257,7 +458,11 @@ def get_approved_count() -> int:
 # CHANNELS
 # ============================================================
 
-def add_channel(chat_id: str, title: str, invite_link: str):
+def add_channel(
+    chat_id: str,
+    title: str,
+    invite_link: str,
+):
     conn = get_connection()
 
     conn.execute("""
@@ -278,6 +483,7 @@ def add_channel(chat_id: str, title: str, invite_link: str):
 
 
 def remove_channel(chat_id: str):
+
     conn = get_connection()
 
     conn.execute("""
@@ -290,15 +496,20 @@ def remove_channel(chat_id: str):
 
 
 def get_channels() -> List[Tuple]:
+
     conn = get_connection()
 
     channels = conn.execute("""
-        SELECT chat_id, title, invite_link
+        SELECT
+            chat_id,
+            title,
+            invite_link
         FROM channels
         ORDER BY id ASC
     """).fetchall()
 
     conn.close()
+
     return channels
 
 
@@ -307,16 +518,20 @@ def get_channels() -> List[Tuple]:
 # ============================================================
 
 def get_user_count() -> int:
+
     conn = get_connection()
+
     count = conn.execute(
         "SELECT COUNT(*) FROM users"
     ).fetchone()[0]
 
     conn.close()
+
     return count
 
 
 def get_verified_count() -> int:
+
     conn = get_connection()
 
     count = conn.execute("""
@@ -326,6 +541,7 @@ def get_verified_count() -> int:
     """).fetchone()[0]
 
     conn.close()
+
     return count
 
 
@@ -334,18 +550,18 @@ def get_verified_count() -> int:
 # ============================================================
 
 DEFAULT_WELCOME = (
-    "🌹 <b>Welcome {mention}!</b>\n\n"
-    "Welcome to <b>{chatname}</b>.\n\n"
+    "🌹 Welcome {mention}!\n\n"
+    "Welcome to {chatname}.\n\n"
     "Please read the group rules and enjoy your stay! ❤️"
 )
 
 DEFAULT_GOODBYE = (
-    "👋 <b>{name}</b> has left the group.\n\n"
+    "👋 {name} has left the group.\n\n"
     "Goodbye!"
 )
 
 DEFAULT_RULES = (
-    "📜 <b>Group Rules</b>\n\n"
+    "📜 Group Rules\n\n"
     "1. Be respectful.\n"
     "2. No spam.\n"
     "3. No unwanted links.\n"
@@ -355,6 +571,7 @@ DEFAULT_RULES = (
 
 
 def ensure_group(chat_id: int):
+
     conn = get_connection()
 
     conn.execute("""
@@ -380,6 +597,7 @@ def ensure_group(chat_id: int):
 
 
 def get_group_settings(chat_id: int):
+
     ensure_group(chat_id)
 
     conn = get_connection()
@@ -397,15 +615,22 @@ def get_group_settings(chat_id: int):
     """, (chat_id,)).fetchone()
 
     conn.close()
+
     return result
 
 
-def set_welcome(chat_id: int, enabled: bool, text=None):
+def set_welcome(
+    chat_id: int,
+    enabled: bool,
+    text=None,
+):
+
     ensure_group(chat_id)
 
     conn = get_connection()
 
     if text is None:
+
         conn.execute("""
             UPDATE group_settings
             SET welcome_enabled = ?
@@ -414,10 +639,13 @@ def set_welcome(chat_id: int, enabled: bool, text=None):
             1 if enabled else 0,
             chat_id,
         ))
+
     else:
+
         conn.execute("""
             UPDATE group_settings
-            SET welcome_enabled = ?, welcome_text = ?
+            SET welcome_enabled = ?,
+                welcome_text = ?
             WHERE chat_id = ?
         """, (
             1 if enabled else 0,
@@ -429,7 +657,11 @@ def set_welcome(chat_id: int, enabled: bool, text=None):
     conn.close()
 
 
-def set_goodbye(chat_id: int, enabled: bool):
+def set_goodbye(
+    chat_id: int,
+    enabled: bool,
+):
+
     ensure_group(chat_id)
 
     conn = get_connection()
@@ -447,7 +679,11 @@ def set_goodbye(chat_id: int, enabled: bool):
     conn.close()
 
 
-def set_rules(chat_id: int, rules: str):
+def set_rules(
+    chat_id: int,
+    rules: str,
+):
+
     ensure_group(chat_id)
 
     conn = get_connection()
@@ -469,13 +705,18 @@ def set_rules(chat_id: int, rules: str):
 # WARNINGS
 # ============================================================
 
-def get_warns(chat_id: int, user_id: int) -> int:
+def get_warns(
+    chat_id: int,
+    user_id: int,
+) -> int:
+
     conn = get_connection()
 
     result = conn.execute("""
         SELECT count
         FROM warnings
-        WHERE chat_id = ? AND user_id = ?
+        WHERE chat_id = ?
+        AND user_id = ?
     """, (
         chat_id,
         user_id,
@@ -486,8 +727,16 @@ def get_warns(chat_id: int, user_id: int) -> int:
     return result[0] if result else 0
 
 
-def add_warn(chat_id: int, user_id: int) -> int:
-    current = get_warns(chat_id, user_id)
+def add_warn(
+    chat_id: int,
+    user_id: int,
+) -> int:
+
+    current = get_warns(
+        chat_id,
+        user_id,
+    )
+
     new_count = current + 1
 
     conn = get_connection()
@@ -513,12 +762,17 @@ def add_warn(chat_id: int, user_id: int) -> int:
     return new_count
 
 
-def reset_warns(chat_id: int, user_id: int):
+def reset_warns(
+    chat_id: int,
+    user_id: int,
+):
+
     conn = get_connection()
 
     conn.execute("""
         DELETE FROM warnings
-        WHERE chat_id = ? AND user_id = ?
+        WHERE chat_id = ?
+        AND user_id = ?
     """, (
         chat_id,
         user_id,
@@ -532,7 +786,12 @@ def reset_warns(chat_id: int, user_id: int):
 # LOCKS
 # ============================================================
 
-def set_lock(chat_id: int, lock_type: str, enabled: bool):
+def set_lock(
+    chat_id: int,
+    lock_type: str,
+    enabled: bool,
+):
+
     conn = get_connection()
 
     conn.execute("""
@@ -554,13 +813,18 @@ def set_lock(chat_id: int, lock_type: str, enabled: bool):
     conn.close()
 
 
-def is_locked(chat_id: int, lock_type: str) -> bool:
+def is_locked(
+    chat_id: int,
+    lock_type: str,
+) -> bool:
+
     conn = get_connection()
 
     result = conn.execute("""
         SELECT enabled
         FROM locks
-        WHERE chat_id = ? AND lock_type = ?
+        WHERE chat_id = ?
+        AND lock_type = ?
     """, (
         chat_id,
         lock_type,
@@ -572,12 +836,14 @@ def is_locked(chat_id: int, lock_type: str) -> bool:
 
 
 def get_locks(chat_id: int):
+
     conn = get_connection()
 
     rows = conn.execute("""
         SELECT lock_type
         FROM locks
-        WHERE chat_id = ? AND enabled = 1
+        WHERE chat_id = ?
+        AND enabled = 1
         ORDER BY lock_type
     """, (chat_id,)).fetchall()
 
@@ -590,7 +856,12 @@ def get_locks(chat_id: int):
 # FEDERATION
 # ============================================================
 
-def create_federation(fed_id: str, name: str, owner_id: int):
+def create_federation(
+    fed_id: str,
+    name: str,
+    owner_id: int,
+):
+
     conn = get_connection()
 
     conn.execute("""
@@ -611,19 +882,28 @@ def create_federation(fed_id: str, name: str, owner_id: int):
 
 
 def get_federation(fed_id: str):
+
     conn = get_connection()
 
     result = conn.execute("""
-        SELECT fed_id, name, owner_id
+        SELECT
+            fed_id,
+            name,
+            owner_id
         FROM federations
         WHERE fed_id = ?
     """, (fed_id,)).fetchone()
 
     conn.close()
+
     return result
 
 
-def add_fed_chat(fed_id: str, chat_id: int):
+def add_fed_chat(
+    fed_id: str,
+    chat_id: int,
+):
+
     conn = get_connection()
 
     conn.execute("""
@@ -641,7 +921,11 @@ def add_fed_chat(fed_id: str, chat_id: int):
     conn.close()
 
 
-def fed_ban(fed_id: str, user_id: int):
+def fed_ban(
+    fed_id: str,
+    user_id: int,
+):
+
     conn = get_connection()
 
     conn.execute("""
@@ -659,12 +943,17 @@ def fed_ban(fed_id: str, user_id: int):
     conn.close()
 
 
-def fed_unban(fed_id: str, user_id: int):
+def fed_unban(
+    fed_id: str,
+    user_id: int,
+):
+
     conn = get_connection()
 
     conn.execute("""
         DELETE FROM federation_bans
-        WHERE fed_id = ? AND user_id = ?
+        WHERE fed_id = ?
+        AND user_id = ?
     """, (
         fed_id,
         user_id,
@@ -674,13 +963,18 @@ def fed_unban(fed_id: str, user_id: int):
     conn.close()
 
 
-def is_fed_banned(fed_id: str, user_id: int) -> bool:
+def is_fed_banned(
+    fed_id: str,
+    user_id: int,
+) -> bool:
+
     conn = get_connection()
 
     result = conn.execute("""
         SELECT 1
         FROM federation_bans
-        WHERE fed_id = ? AND user_id = ?
+        WHERE fed_id = ?
+        AND user_id = ?
     """, (
         fed_id,
         user_id,
@@ -691,7 +985,11 @@ def is_fed_banned(fed_id: str, user_id: int) -> bool:
     return bool(result)
 
 
-def fed_mute(fed_id: str, user_id: int):
+def fed_mute(
+    fed_id: str,
+    user_id: int,
+):
+
     conn = get_connection()
 
     conn.execute("""
@@ -709,12 +1007,17 @@ def fed_mute(fed_id: str, user_id: int):
     conn.close()
 
 
-def fed_unmute(fed_id: str, user_id: int):
+def fed_unmute(
+    fed_id: str,
+    user_id: int,
+):
+
     conn = get_connection()
 
     conn.execute("""
         DELETE FROM federation_mutes
-        WHERE fed_id = ? AND user_id = ?
+        WHERE fed_id = ?
+        AND user_id = ?
     """, (
         fed_id,
         user_id,
@@ -724,13 +1027,18 @@ def fed_unmute(fed_id: str, user_id: int):
     conn.close()
 
 
-def is_fed_muted(fed_id: str, user_id: int) -> bool:
+def is_fed_muted(
+    fed_id: str,
+    user_id: int,
+) -> bool:
+
     conn = get_connection()
 
     result = conn.execute("""
         SELECT 1
         FROM federation_mutes
-        WHERE fed_id = ? AND user_id = ?
+        WHERE fed_id = ?
+        AND user_id = ?
     """, (
         fed_id,
         user_id,
