@@ -1,31 +1,40 @@
+import os
 import logging
-import re
-import html
+
+from dotenv import load_dotenv
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ChatPermissions,
 )
-from telegram.constants import ChatMemberStatus, ChatType
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
-)
-
-from telegram.error import TelegramError, BadRequest
-
-from config import (
-    BOT_TOKEN,
-    OWNER_ID,
-    FORCE_JOIN_CHANNELS,
+    ChatMemberHandler,
 )
 
 import database
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is missing in .env")
+
+if not OWNER_ID:
+    raise ValueError("OWNER_ID is missing in .env")
 
 
 # ============================================================
@@ -41,43 +50,80 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# BOT SETTINGS
+# DATABASE
 # ============================================================
-
-BOT_NAME = "JoinGuard Bot"
 
 database.init_db()
 
 
 # ============================================================
-# BASIC HELPERS
+# FORCE JOIN
 # ============================================================
 
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
+FORCE_JOIN_CHANNELS = [
+    "-1003998560024",
+    "-1004077604887",
+]
 
+
+# ============================================================
+# APPROVAL STATUS
+# ============================================================
+
+PENDING = 0
+APPROVED = 1
+REJECTED = 2
+REVOKED = 3
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def mention_user(user):
+
+    return user.first_name or "User"
+
+
+def status_name(status):
+
+    return {
+        PENDING: "⏳ Pending",
+        APPROVED: "✅ Approved",
+        REJECTED: "❌ Rejected",
+        REVOKED: "🚫 Revoked",
+    }.get(status, "❓ Unknown")
+
+
+# ============================================================
+# ADMIN
+# ============================================================
 
 async def is_admin(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int = None,
 ) -> bool:
 
-    user = update.effective_user
-    chat = update.effective_chat
-
-    if not user or not chat:
+    if not update.effective_chat:
         return False
 
-    if is_owner(user.id):
+    if user_id is None:
+
+        if not update.effective_user:
+            return False
+
+        user_id = update.effective_user.id
+
+    if user_id == OWNER_ID:
         return True
 
-    if chat.type == ChatType.PRIVATE:
+    if update.effective_chat.type == "private":
         return False
 
     try:
-        member = await context.bot.get_chat_member(
-            chat.id,
-            user.id,
+
+        member = await update.effective_chat.get_member(
+            user_id
         )
 
         return member.status in (
@@ -85,141 +131,38 @@ async def is_admin(
             ChatMemberStatus.OWNER,
         )
 
-    except Exception as exc:
-        logger.error("Admin check failed: %s", exc)
-        return False
+    except Exception as e:
 
-
-async def bot_is_admin(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-) -> bool:
-
-    try:
-        me = await context.bot.get_me()
-
-        member = await context.bot.get_chat_member(
-            chat_id,
-            me.id,
+        logger.error(
+            "Admin check failed: %s",
+            e,
         )
 
-        return member.status in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        )
-
-    except Exception:
         return False
-
-
-async def require_admin(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> bool:
-
-    if not await is_admin(update, context):
-
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ <b>Admins only.</b>",
-                parse_mode="HTML",
-            )
-
-        return False
-
-    return True
-
-
-def get_target_user(update: Update):
-    """
-    Supports:
-    /command 123456789
-    /command @username
-    Reply to a user's message
-    """
-
-    message = update.effective_message
-
-    if not message:
-        return None
-
-    if message.reply_to_message:
-        return message.reply_to_message.from_user
-
-    if not message.text:
-        return None
-
-    parts = message.text.split()
-
-    if len(parts) < 2:
-        return None
-
-    target = parts[1]
-
-    return target
-
-
-async def resolve_user(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    message = update.effective_message
-
-    if message.reply_to_message:
-        return message.reply_to_message.from_user
-
-    if not message.text:
-        return None
-
-    parts = message.text.split()
-
-    if len(parts) < 2:
-        return None
-
-    target = parts[1]
-
-    try:
-        user_id = int(target)
-
-        return await context.bot.get_chat_member(
-            update.effective_chat.id,
-            user_id,
-        )
-
-    except Exception:
-        pass
-
-    if target.startswith("@"):
-        try:
-            chat = await context.bot.get_chat(target)
-
-            return await context.bot.get_chat_member(
-                update.effective_chat.id,
-                chat.id,
-            )
-
-        except Exception:
-            return None
-
-    return None
 
 
 # ============================================================
-# FORCE JOIN MEMBERSHIP
+# MEMBERSHIP CHECK
 # ============================================================
 
-async def is_user_joined(
+async def check_membership(
     context: ContextTypes.DEFAULT_TYPE,
-    chat_id,
     user_id: int,
+    chat_id: str,
 ) -> bool:
 
     try:
 
         member = await context.bot.get_chat_member(
-            chat_id=chat_id,
+            chat_id=int(chat_id),
             user_id=user_id,
+        )
+
+        logger.info(
+            "Membership | user=%s | channel=%s | status=%s",
+            user_id,
+            chat_id,
+            member.status,
         )
 
         return member.status in (
@@ -229,189 +172,451 @@ async def is_user_joined(
             ChatMemberStatus.RESTRICTED,
         )
 
-    except Exception as exc:
+    except Exception as e:
 
         logger.error(
-            "Membership check failed for %s: %s",
+            "Membership failed | user=%s | channel=%s | error=%s",
+            user_id,
             chat_id,
-            exc,
+            e,
         )
 
         return False
 
 
-async def check_all_channels(
+async def is_force_joined(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
 ) -> bool:
 
     for channel_id in FORCE_JOIN_CHANNELS:
 
-        joined = await is_user_joined(
+        if not await check_membership(
             context,
-            channel_id,
             user_id,
-        )
+            channel_id,
+        ):
 
-        if not joined:
             return False
 
     return True
 
 
-async def get_channel_button(
-    context: ContextTypes.DEFAULT_TYPE,
-    channel_id,
-    index: int,
-):
+# ============================================================
+# FORCE JOIN KEYBOARD
+# ============================================================
 
-    title = f"Channel {index}"
-    invite_link = None
+def force_join_keyboard():
 
-    try:
+    return InlineKeyboardMarkup([
 
-        chat = await context.bot.get_chat(channel_id)
-
-        title = chat.title or title
-
-        # If channel has username
-        if chat.username:
-            invite_link = f"https://t.me/{chat.username}"
-
-        else:
-
-            # Try creating an invite link.
-            try:
-                invite = await context.bot.create_chat_invite_link(
-                    chat_id=channel_id
-                )
-
-                invite_link = invite.invite_link
-
-            except Exception:
-                pass
-
-    except Exception as exc:
-
-        logger.warning(
-            "Could not get channel information: %s",
-            exc,
-        )
-
-    return title, invite_link
-
-
-def build_force_join_keyboard(channels):
-
-    keyboard = []
-
-    for index, (title, invite_link) in enumerate(
-        channels,
-        start=1,
-    ):
-
-        if invite_link:
-
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"📢 Join {title}",
-                        url=invite_link,
-                    )
-                ]
-            )
-
-        else:
-
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"📢 {title}",
-                        callback_data=f"no_link_{index}",
-                    )
-                ]
-            )
-
-    keyboard.append(
         [
             InlineKeyboardButton(
-                "🔄 I've Joined",
+                "📢 Join Channel 1",
+                url="https://t.me/+RsAsljvxgWZKkNzg1",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📢 Join Channel 2",
+                url="https://t.me/Il_Ravan_bhai_ll",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "✅ I've Joined",
                 callback_data="verify_join",
             )
-        ]
-    )
+        ],
 
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 
-async def send_force_join(
+# ============================================================
+# REQUEST APPROVAL KEYBOARD
+# ============================================================
+
+def request_approval_keyboard():
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "📨 Request Approval",
+                callback_data="request_approval",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🔄 Check Membership",
+                callback_data="verify_join",
+            )
+        ],
+
+    ])
+
+
+# ============================================================
+# OWNER APPROVAL BUTTONS
+# ============================================================
+
+def approval_keyboard(
+    user_id: int,
+):
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "✅ Approve",
+                callback_data=f"approve:{user_id}",
+            ),
+
+            InlineKeyboardButton(
+                "❌ Reject",
+                callback_data=f"reject:{user_id}",
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🚫 Revoke",
+                callback_data=f"revoke:{user_id}",
+            ),
+
+            InlineKeyboardButton(
+                "🔄 Re-Approve",
+                callback_data=f"reapprove:{user_id}",
+            ),
+        ],
+
+    ])
+
+
+# ============================================================
+# FORCE JOIN MESSAGE
+# ============================================================
+
+async def force_join_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    user = update.effective_user
-
-    channels = []
-
-    for index, channel_id in enumerate(
-        FORCE_JOIN_CHANNELS,
-        start=1,
-    ):
-
-        joined = await is_user_joined(
-            context,
-            channel_id,
-            user.id,
-        )
-
-        if not joined:
-
-            title, invite_link = await get_channel_button(
-                context,
-                channel_id,
-                index,
-            )
-
-            channels.append(
-                (
-                    title,
-                    invite_link,
-                )
-            )
-
-    if not channels:
-        return True
-
-    keyboard = build_force_join_keyboard(
-        channels
-    )
-
     text = (
-        "🔐 <b>Force Join Required</b>\n\n"
-        f"Welcome to <b>{BOT_NAME}</b>.\n\n"
-        "You must join <b>ALL</b> required channels "
-        "before using the bot.\n\n"
-        "After joining them, press:\n"
-        "<b>🔄 I've Joined</b>"
+        "🔐 <b>Access Locked</b>\n\n"
+        "To use this bot, you must join all required channels.\n\n"
+        "1️⃣ Join Channel 1\n"
+        "2️⃣ Join Channel 2\n\n"
+        "After joining both channels, press "
+        "<b>I've Joined</b>."
     )
 
     if update.callback_query:
 
-        await update.callback_query.edit_message_text(
-            text=text,
-            reply_markup=keyboard,
+        await update.callback_query.message.edit_text(
+            text,
+            reply_markup=force_join_keyboard(),
             parse_mode="HTML",
         )
 
     else:
 
         await update.effective_message.reply_text(
-            text=text,
-            reply_markup=keyboard,
+            text,
+            reply_markup=force_join_keyboard(),
             parse_mode="HTML",
         )
 
-    return False
+
+# ============================================================
+# SEND APPROVAL REQUEST TO OWNER
+# ============================================================
+
+async def send_approval_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+):
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "No username"
+    )
+
+    text = (
+        "🔔 <b>NEW ACCESS REQUEST</b>\n\n"
+        f"👤 Name: <b>{mention_user(user)}</b>\n"
+        f"🔗 Username: <b>{username}</b>\n"
+        f"🆔 ID: <code>{user.id}</code>\n\n"
+        "📢 User has joined all required channels.\n\n"
+        "Select an action:"
+    )
+
+    await context.bot.send_message(
+        chat_id=OWNER_ID,
+        text=text,
+        reply_markup=approval_keyboard(user.id),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# ACCESS REQUEST
+# ============================================================
+
+async def request_approval(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    user = query.from_user
+
+    try:
+        await query.answer(
+            "📨 Sending approval request..."
+        )
+    except Exception:
+        pass
+
+    # Check membership again
+    joined = await is_force_joined(
+        context,
+        user.id,
+    )
+
+    if not joined:
+
+        await query.message.edit_text(
+            "❌ <b>Channels Not Joined</b>\n\n"
+            "You must join all required channels first.",
+            reply_markup=force_join_keyboard(),
+            parse_mode="HTML",
+        )
+
+        return
+
+    database.add_user(
+        user.id,
+        user.first_name or "",
+        user.username or "",
+    )
+
+    current_status = database.get_approval_status(
+        user.id
+    )
+
+    # Already approved
+    if current_status == APPROVED:
+
+        await query.message.edit_text(
+            "✅ <b>Already Approved</b>\n\n"
+            "Your access is already active.\n\n"
+            "Use /help to continue.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # Already pending
+    if current_status == PENDING:
+
+        await query.message.edit_text(
+            "⏳ <b>Request Already Sent</b>\n\n"
+            "Your approval request is waiting for the owner.\n\n"
+            "Please wait for the decision.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # Rejected / revoked -> allowed to request again
+    database.set_approval(
+        user.id,
+        PENDING,
+    )
+
+    await send_approval_request(
+        context,
+        user,
+    )
+
+    await query.message.edit_text(
+        "📨 <b>Approval Request Sent</b>\n\n"
+        "Your request has been sent to the owner.\n\n"
+        "⏳ Please wait for approval.",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# VERIFY JOIN
+# ============================================================
+
+async def verify_join(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    user = query.from_user
+
+    try:
+
+        await query.answer(
+            "🔍 Checking your membership..."
+        )
+
+        await query.message.edit_text(
+            "🔍 <b>Checking your membership...</b>\n\n"
+            "Please wait...",
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Verification UI error: %s",
+            e,
+        )
+
+    try:
+
+        joined = await is_force_joined(
+            context,
+            user.id,
+        )
+
+        if not joined:
+
+            await query.message.edit_text(
+                "❌ <b>Verification Failed</b>\n\n"
+                "You have not joined all required channels.\n\n"
+                "Please join both channels and try again.",
+                reply_markup=force_join_keyboard(),
+                parse_mode="HTML",
+            )
+
+            return
+
+        database.add_user(
+            user.id,
+            user.first_name or "",
+            user.username or "",
+        )
+
+        status = database.get_approval_status(
+            user.id
+        )
+
+        # ----------------------------------------------------
+        # ALREADY APPROVED
+        # ----------------------------------------------------
+
+        if status == APPROVED:
+
+            await query.message.edit_text(
+                "✅ <b>Already Approved</b>\n\n"
+                "🔓 Your access is already active.\n\n"
+                "Use /help to see available commands.",
+                parse_mode="HTML",
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # PENDING
+        # ----------------------------------------------------
+
+        if status == PENDING:
+
+            await query.message.edit_text(
+                "⏳ <b>Approval Pending</b>\n\n"
+                "You have joined all required channels.\n\n"
+                "📨 Your approval request is already "
+                "waiting for the owner.\n\n"
+                "Please wait.",
+                parse_mode="HTML",
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # REJECTED / REVOKED
+        # ----------------------------------------------------
+
+        if status in (
+            REJECTED,
+            REVOKED,
+        ):
+
+            await query.message.edit_text(
+                f"{status_name(status)}\n\n"
+                "Your previous access is no longer active.\n\n"
+                "You can request access again.",
+                reply_markup=request_approval_keyboard(),
+                parse_mode="HTML",
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # FIRST REQUEST
+        # ----------------------------------------------------
+
+        database.set_verified(
+            user.id,
+            True,
+        )
+
+        database.set_approval(
+            user.id,
+            PENDING,
+        )
+
+        await send_approval_request(
+            context,
+            user,
+        )
+
+        await query.message.edit_text(
+            "📨 <b>Approval Request Sent</b>\n\n"
+            "You have successfully joined all required "
+            "channels.\n\n"
+            "⏳ Your request has been sent to the owner.\n"
+            "Please wait for approval.",
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Verification error: %s",
+            e,
+        )
+
+        try:
+
+            await query.message.edit_text(
+                "⚠️ <b>Verification Error</b>\n\n"
+                "Please try again.",
+                reply_markup=force_join_keyboard(),
+                parse_mode="HTML",
+            )
+
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -434,228 +639,1131 @@ async def start(
         user.username or "",
     )
 
-    # Owner
-    if is_owner(user.id):
+    # Owner bypass
+    if user.id == OWNER_ID:
 
-        await update.message.reply_text(
-            f"👑 <b>Welcome Owner!</b>\n\n"
-            f"🛡️ <b>{BOT_NAME}</b>\n\n"
+        await update.effective_message.reply_text(
+            "👑 <b>Welcome Owner!</b>\n\n"
+            "🛡️ <b>JoinGuard Bot</b>\n\n"
             "Use /panel for the owner panel.\n"
-            "Use /help to see commands.",
+            "Use /help for commands.",
             parse_mode="HTML",
         )
 
         return
 
-    # Revoked
-    approval = database.get_approval_status(
-        user.id
-    )
-
-    if approval == -1:
-
-        await update.message.reply_text(
-            "🚫 <b>Access Revoked</b>\n\n"
-            "Your access to this bot has been revoked "
-            "by the owner.",
-            parse_mode="HTML",
-        )
-
-        return
-
-    # Approval required
-    if approval != 1:
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "📩 Request Access",
-                    callback_data="request_again",
-                )
-            ]
-        ]
-
-        await update.message.reply_text(
-            "🔐 <b>Access Required</b>\n\n"
-            "You need owner approval before using "
-            "this bot.\n\n"
-            "Click below to request access.",
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
-            ),
-            parse_mode="HTML",
-        )
-
-        return
-
-    # Force join
-    joined = await check_all_channels(
+    # Check channels
+    joined = await is_force_joined(
         context,
         user.id,
     )
 
     if not joined:
 
-        database.set_verified(
-            user.id,
-            False,
-        )
-
-        await send_force_join(
+        await force_join_message(
             update,
             context,
         )
 
         return
 
-    database.set_verified(
-        user.id,
-        True,
+    status = database.get_approval_status(
+        user.id
     )
 
-    await update.message.reply_text(
-        f"🎉 <b>Welcome {html.escape(user.first_name or '')}!</b>\n\n"
-        "✅ Access approved\n"
-        "✅ Required channels joined\n"
-        "🔓 Access unlocked\n\n"
-        f"🚀 <b>{BOT_NAME}</b> is ready.",
-        parse_mode="HTML",
-    )
+    # Approved
+    if status == APPROVED:
 
-
-# ============================================================
-# VERIFY JOIN
-# ============================================================
-
-async def verify_join(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    query = update.callback_query
-    user = query.from_user
-
-    await query.answer(
-        "🔍 Checking membership..."
-    )
-
-    if database.get_approval_status(user.id) != 1:
-
-        await query.answer(
-            "❌ You are not approved yet.",
-            show_alert=True,
-        )
-
-        return
-
-    joined = await check_all_channels(
-        context,
-        user.id,
-    )
-
-    if not joined:
-
-        database.set_verified(
-            user.id,
-            False,
-        )
-
-        await query.answer(
-            "❌ You haven't joined all required channels.",
-            show_alert=True,
-        )
-
-        # Rebuild keyboard instead of modifying tuples
-        channels = []
-
-        for index, channel_id in enumerate(
-            FORCE_JOIN_CHANNELS,
-            start=1,
-        ):
-
-            member_joined = await is_user_joined(
-                context,
-                channel_id,
-                user.id,
-            )
-
-            if not member_joined:
-
-                title, invite_link = await get_channel_button(
-                    context,
-                    channel_id,
-                    index,
-                )
-
-                channels.append(
-                    (
-                        title,
-                        invite_link,
-                    )
-                )
-
-        keyboard = build_force_join_keyboard(
-            channels
-        )
-
-        await query.edit_message_text(
-            "❌ <b>Verification Failed</b>\n\n"
-            "You still haven't joined all required "
-            "channels.\n\n"
-            "Join the remaining channel(s) and "
-            "press <b>🔄 I've Joined</b> again.",
-            reply_markup=keyboard,
+        await update.effective_message.reply_text(
+            f"👋 <b>Welcome {mention_user(user)}!</b>\n\n"
+            "🟢 <b>Access: APPROVED</b>\n\n"
+            "Use /help to see available commands.",
             parse_mode="HTML",
         )
 
         return
 
-    database.set_verified(
-        user.id,
-        True,
-    )
+    # Pending
+    if status == PENDING:
 
-    await query.edit_message_text(
-        "🎉 <b>Verification Successful!</b>\n\n"
-        "✅ All required channels joined.\n"
-        "🔓 <b>Access Unlocked!</b>\n\n"
-        f"Welcome to <b>{BOT_NAME}</b>.",
+        await update.effective_message.reply_text(
+            "⏳ <b>Approval Pending</b>\n\n"
+            "Your request is waiting for owner approval.\n\n"
+            "Please wait.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # Rejected / revoked
+    if status in (
+        REJECTED,
+        REVOKED,
+    ):
+
+        await update.effective_message.reply_text(
+            f"{status_name(status)}\n\n"
+            "Your previous access is not active.\n\n"
+            "You can request access again.",
+            reply_markup=request_approval_keyboard(),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # First time
+    await update.effective_message.reply_text(
+        "📨 <b>Access Request</b>\n\n"
+        "You have joined all required channels.\n\n"
+        "Click below to request approval.",
+        reply_markup=request_approval_keyboard(),
         parse_mode="HTML",
     )
 
 
 # ============================================================
-# REQUEST ACCESS
+# APPROVE COMMAND
 # ============================================================
 
-async def request_again(
+async def approve_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+
+        await update.effective_message.reply_text(
+            "❌ Owner only."
+        )
+
+        return
+
+    if not context.args:
+
+        await update.effective_message.reply_text(
+            "Usage:\n"
+            "/approve @username"
+        )
+
+        return
+
+    username = context.args[0]
+
+    target = database.get_user_by_username(
+        username
+    )
+
+    if not target:
+
+        await update.effective_message.reply_text(
+            f"❌ User {username} was not found.\n\n"
+            "The user must have started the bot first."
+        )
+
+        return
+
+    user_id = target[0]
+    name = target[1] or "User"
+    current = target[4]
+
+    database.set_approval(
+        user_id,
+        APPROVED,
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ <b>Access Approved!</b>\n\n"
+                "🎉 Your request has been approved by the owner.\n\n"
+                "🔓 Your bot access is now active.\n\n"
+                "Use /help to continue."
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Could not notify approved user %s: %s",
+            user_id,
+            e,
+        )
+
+    await update.effective_message.reply_text(
+        "✅ <b>User Approved</b>\n\n"
+        f"👤 {name}\n"
+        f"🆔 <code>{user_id}</code>\n"
+        f"🔗 {username}\n\n"
+        f"Previous status: <b>{status_name(current)}</b>\n"
+        "New status: <b>✅ Approved</b>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# REJECT COMMAND
+# ============================================================
+
+async def reject_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if update.effective_user.id != OWNER_ID:
+
+        await update.effective_message.reply_text(
+            "❌ Owner only."
+        )
+
+        return
+
+    if not context.args:
+
+        await update.effective_message.reply_text(
+            "Usage:\n"
+            "/reject @username"
+        )
+
+        return
+
+    target = database.get_user_by_username(
+        context.args[0]
+    )
+
+    if not target:
+
+        await update.effective_message.reply_text(
+            "❌ User not found."
+        )
+
+        return
+
+    user_id = target[0]
+
+    database.set_approval(
+        user_id,
+        REJECTED,
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "❌ <b>Access Rejected</b>\n\n"
+                "Your access request has been rejected.\n\n"
+                "You may request access again later."
+            ),
+            reply_markup=request_approval_keyboard(),
+            parse_mode="HTML",
+        )
+
+    except Exception:
+        pass
+
+    await update.effective_message.reply_text(
+        "❌ User rejected successfully."
+    )
+
+
+# ============================================================
+# REVOKE COMMAND
+# ============================================================
+
+async def revoke_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if update.effective_user.id != OWNER_ID:
+
+        await update.effective_message.reply_text(
+            "❌ Owner only."
+        )
+
+        return
+
+    if not context.args:
+
+        await update.effective_message.reply_text(
+            "Usage:\n"
+            "/revoke @username"
+        )
+
+        return
+
+    target = database.get_user_by_username(
+        context.args[0]
+    )
+
+    if not target:
+
+        await update.effective_message.reply_text(
+            "❌ User not found."
+        )
+
+        return
+
+    user_id = target[0]
+
+    database.set_approval(
+        user_id,
+        REVOKED,
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🚫 <b>Access Revoked</b>\n\n"
+                "Your bot access has been revoked.\n\n"
+                "If you need access again, you can submit "
+                "a new request."
+            ),
+            reply_markup=request_approval_keyboard(),
+            parse_mode="HTML",
+        )
+
+    except Exception:
+        pass
+
+    await update.effective_message.reply_text(
+        "🚫 User access revoked."
+    )
+
+
+# ============================================================
+# RE-APPROVE COMMAND
+# ============================================================
+
+async def reapprove_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if update.effective_user.id != OWNER_ID:
+
+        await update.effective_message.reply_text(
+            "❌ Owner only."
+        )
+
+        return
+
+    if not context.args:
+
+        await update.effective_message.reply_text(
+            "Usage:\n"
+            "/reapprove @username"
+        )
+
+        return
+
+    target = database.get_user_by_username(
+        context.args[0]
+    )
+
+    if not target:
+
+        await update.effective_message.reply_text(
+            "❌ User not found."
+        )
+
+        return
+
+    user_id = target[0]
+
+    database.set_approval(
+        user_id,
+        APPROVED,
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🔄 <b>Access Re-Approved!</b>\n\n"
+                "Your access has been restored.\n\n"
+                "🔓 You can use the bot again."
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception:
+        pass
+
+    await update.effective_message.reply_text(
+        "🔄 User re-approved successfully."
+    )
+
+
+# ============================================================
+# APPROVAL BUTTON CALLBACK
+# ============================================================
+
+async def approval_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
     query = update.callback_query
-    user = query.from_user
+
+    if not query:
+        return
+
+    if query.from_user.id != OWNER_ID:
+
+        await query.answer(
+            "❌ Owner only.",
+            show_alert=True,
+        )
+
+        return
+
+    data = query.data
+
+    try:
+
+        action, user_id_text = data.split(
+            ":",
+            1,
+        )
+
+        user_id = int(user_id_text)
+
+    except Exception:
+
+        await query.answer(
+            "❌ Invalid request.",
+            show_alert=True,
+        )
+
+        return
+
+    target = database.get_user(
+        user_id
+    )
+
+    if not target:
+
+        await query.answer(
+            "❌ User not found.",
+            show_alert=True,
+        )
+
+        return
+
+    name = target[1] or "User"
+    username = target[2] or "No username"
+    old_status = target[4]
+
+    # --------------------------------------------------------
+    # APPROVE
+    # --------------------------------------------------------
+
+    if action == "approve":
+
+        database.set_approval(
+            user_id,
+            APPROVED,
+        )
+
+        new_status = APPROVED
+
+        message = (
+            "✅ <b>Access Approved</b>\n\n"
+            f"👤 {name}\n"
+            f"🔗 @{username.lstrip('@') if username != 'No username' else 'No username'}\n"
+            f"🆔 <code>{user_id}</code>"
+        )
+
+        user_message = (
+            "✅ <b>Access Approved!</b>\n\n"
+            "🎉 The owner approved your request.\n\n"
+            "🔓 Your access is now active.\n\n"
+            "Use /help to continue."
+        )
+
+    # --------------------------------------------------------
+    # REJECT
+    # --------------------------------------------------------
+
+    elif action == "reject":
+
+        database.set_approval(
+            user_id,
+            REJECTED,
+        )
+
+        new_status = REJECTED
+
+        message = (
+            "❌ <b>Access Rejected</b>\n\n"
+            f"👤 {name}\n"
+            f"🆔 <code>{user_id}</code>\n\n"
+            "User can request again."
+        )
+
+        user_message = (
+            "❌ <b>Access Rejected</b>\n\n"
+            "Your request has been rejected.\n\n"
+            "You can request access again later."
+        )
+
+    # --------------------------------------------------------
+    # REVOKE
+    # --------------------------------------------------------
+
+    elif action == "revoke":
+
+        database.set_approval(
+            user_id,
+            REVOKED,
+        )
+
+        new_status = REVOKED
+
+        message = (
+            "🚫 <b>Access Revoked</b>\n\n"
+            f"👤 {name}\n"
+            f"🆔 <code>{user_id}</code>\n\n"
+            "User can request access again."
+        )
+
+        user_message = (
+            "🚫 <b>Access Revoked</b>\n\n"
+            "Your bot access has been revoked.\n\n"
+            "You can submit a new request if you "
+            "need access again."
+        )
+
+    # --------------------------------------------------------
+    # RE-APPROVE
+    # --------------------------------------------------------
+
+    elif action == "reapprove":
+
+        database.set_approval(
+            user_id,
+            APPROVED,
+        )
+
+        new_status = APPROVED
+
+        message = (
+            "🔄 <b>Access Re-Approved</b>\n\n"
+            f"👤 {name}\n"
+            f"🆔 <code>{user_id}</code>\n\n"
+            "Access restored."
+        )
+
+        user_message = (
+            "🔄 <b>Access Re-Approved!</b>\n\n"
+            "Your access has been restored.\n\n"
+            "🔓 You can use the bot again."
+        )
+
+    else:
+
+        await query.answer(
+            "❌ Unknown action.",
+            show_alert=True,
+        )
+
+        return
+
+    # Answer callback
+    try:
+
+        await query.answer(
+            "✅ Action completed."
+        )
+
+    except Exception:
+        pass
+
+    # Notify user
+    try:
+
+        keyboard = None
+
+        if new_status in (
+            REJECTED,
+            REVOKED,
+        ):
+
+            keyboard = request_approval_keyboard()
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=user_message,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Could not notify user %s: %s",
+            user_id,
+            e,
+        )
+
+    # Update owner message
+    await query.message.edit_text(
+        message
+        + "\n\n"
+        + f"Previous: <b>{status_name(old_status)}</b>\n"
+        + f"Current: <b>{status_name(new_status)}</b>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# PANEL KEYBOARD
+# ============================================================
+
+def panel_keyboard():
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "📊 Statistics",
+                callback_data="panel_stats",
+            ),
+            InlineKeyboardButton(
+                "👥 Users",
+                callback_data="panel_users",
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📢 Channels",
+                callback_data="panel_channels",
+            ),
+            InlineKeyboardButton(
+                "⚙️ Group",
+                callback_data="panel_group",
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🌹 Rose Commands",
+                callback_data="rose_menu",
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🌐 Federation",
+                callback_data="panel_fed",
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📖 Help",
+                callback_data="panel_help",
+            ),
+        ],
+
+    ])
+
+
+# ============================================================
+# PANEL
+# ============================================================
+
+async def panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    if user.id != OWNER_ID:
+
+        await update.effective_message.reply_text(
+            "❌ <b>Owner Only</b>\n\n"
+            "You are not authorized to use the owner panel.",
+            parse_mode="HTML",
+        )
+
+        return
+
+    await update.effective_message.reply_text(
+        "👑 <b>OWNER CONTROL PANEL</b>\n\n"
+        "🛡️ JoinGuard Bot\n\n"
+        "Select an option below:",
+        reply_markup=panel_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# ROSE MENU
+# ============================================================
+
+def rose_keyboard():
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "🛡 Moderation",
+                callback_data="rose_moderation",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🔒 Locks",
+                callback_data="rose_locks",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "👋 Welcome",
+                callback_data="rose_welcome",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📜 Rules",
+                callback_data="rose_rules",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🌐 Federation",
+                callback_data="rose_fed",
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="panel_back",
+            )
+        ],
+
+    ])
+
+
+async def rose_menu(
+    query,
+):
+
+    await query.message.edit_text(
+        "🌹 <b>ROSE COMMANDS</b>\n\n"
+        "Select a category:",
+        reply_markup=rose_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# ROSE CALLBACK
+# ============================================================
+
+async def rose_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    if query.from_user.id != OWNER_ID:
+
+        await query.answer(
+            "❌ Owner only.",
+            show_alert=True,
+        )
+
+        return
 
     await query.answer()
 
-    database.add_user(
-        user.id,
-        user.first_name or "",
-        user.username or "",
-    )
+    data = query.data
 
-    database.set_approval(
-        user.id,
-        0,
-    )
+    if data == "rose_menu":
 
-    await query.edit_message_text(
-        "📩 <b>Request Sent</b>\n\n"
-        "Your access request has been sent "
-        "to the owner.\n\n"
-        "⏳ Please wait for approval.",
+        await rose_menu(query)
+        return
+
+    if data == "rose_moderation":
+
+        text = (
+            "🛡 <b>MODERATION COMMANDS</b>\n\n"
+            "/warn\n"
+            "/unwarn\n"
+            "/ban\n"
+            "/unban USER_ID\n"
+            "/mute\n"
+            "/unmute\n"
+            "/purge NUMBER"
+        )
+
+    elif data == "rose_locks":
+
+        text = (
+            "🔒 <b>LOCK COMMANDS</b>\n\n"
+            "/lock messages\n"
+            "/unlock messages\n\n"
+            "You can extend lock types later."
+        )
+
+    elif data == "rose_welcome":
+
+        text = (
+            "👋 <b>WELCOME COMMANDS</b>\n\n"
+            "/welcome on\n"
+            "/welcome off\n"
+            "/goodbye on\n"
+            "/goodbye off"
+        )
+
+    elif data == "rose_rules":
+
+        text = (
+            "📜 <b>RULE COMMANDS</b>\n\n"
+            "/rules\n"
+            "/setrules Your rules here"
+        )
+
+    elif data == "rose_fed":
+
+        text = (
+            "🌐 <b>FEDERATION COMMANDS</b>\n\n"
+            "/newfed\n"
+            "/fedban\n"
+            "/fedunban\n"
+            "/fedmute\n"
+            "/fedunmute"
+        )
+
+    else:
+        return
+
+    await query.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Rose Menu",
+                    callback_data="rose_menu",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Panel",
+                    callback_data="panel_back",
+                )
+            ],
+        ]),
         parse_mode="HTML",
     )
+
+
+# ============================================================
+# PANEL CALLBACK
+# ============================================================
+
+async def panel_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    if query.from_user.id != OWNER_ID:
+
+        await query.answer(
+            "❌ Owner only.",
+            show_alert=True,
+        )
+
+        return
+
+    await query.answer()
+
+    data = query.data
+
+    # --------------------------------------------------------
+    # STATISTICS
+    # --------------------------------------------------------
+
+    if data == "panel_stats":
+
+        text = (
+            "📊 <b>BOT STATISTICS</b>\n\n"
+            f"👥 Total Users: "
+            f"<b>{database.get_user_count()}</b>\n\n"
+            f"🔐 Verified: "
+            f"<b>{database.get_verified_count()}</b>\n"
+            f"⏳ Pending: "
+            f"<b>{database.get_pending_count()}</b>\n"
+            f"✅ Approved: "
+            f"<b>{database.get_approved_count()}</b>\n"
+            f"❌ Rejected: "
+            f"<b>{database.get_rejected_count()}</b>\n"
+            f"🚫 Revoked: "
+            f"<b>{database.get_revoked_count()}</b>"
+        )
+
+        await query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="panel_back",
+                    )
+                ]
+            ]),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # USERS
+    # --------------------------------------------------------
+
+    if data == "panel_users":
+
+        text = (
+            "👥 <b>USER MANAGEMENT</b>\n\n"
+            f"Total: {database.get_user_count()}\n"
+            f"⏳ Pending: {database.get_pending_count()}\n"
+            f"✅ Approved: {database.get_approved_count()}\n"
+            f"❌ Rejected: {database.get_rejected_count()}\n"
+            f"🚫 Revoked: {database.get_revoked_count()}\n\n"
+            "Commands:\n"
+            "/approve @username\n"
+            "/reject @username\n"
+            "/revoke @username\n"
+            "/reapprove @username"
+        )
+
+        await query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="panel_back",
+                    )
+                ]
+            ]),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # CHANNELS
+    # --------------------------------------------------------
+
+    if data == "panel_channels":
+
+        text = (
+            "📢 <b>FORCE JOIN CHANNELS</b>\n\n"
+            f"1️⃣ <code>-1003998560024</code>\n"
+            f"2️⃣ <code>-1004077604887</code>\n\n"
+            "Both channels are required."
+        )
+
+        await query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="panel_back",
+                    )
+                ]
+            ]),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # GROUP
+    # --------------------------------------------------------
+
+    if data == "panel_group":
+
+        text = (
+            "⚙️ <b>GROUP MANAGEMENT</b>\n\n"
+            "/welcome on\n"
+            "/welcome off\n"
+            "/goodbye on\n"
+            "/goodbye off\n"
+            "/rules\n"
+            "/setrules\n"
+            "/warn\n"
+            "/unwarn\n"
+            "/ban\n"
+            "/unban\n"
+            "/mute\n"
+            "/unmute\n"
+            "/purge\n"
+            "/lock\n"
+            "/unlock"
+        )
+
+        await query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="panel_back",
+                    )
+                ]
+            ]),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # FEDERATION
+    # --------------------------------------------------------
+
+    if data == "panel_fed":
+
+        text = (
+            "🌐 <b>FEDERATION</b>\n\n"
+            "/newfed\n"
+            "/fedban\n"
+            "/fedunban\n"
+            "/fedmute\n"
+            "/fedunmute"
+        )
+
+        await query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="panel_back",
+                    )
+                ]
+            ]),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # HELP
+    # --------------------------------------------------------
+
+    if data == "panel_help":
+
+        text = (
+            "📖 <b>COMMAND HELP</b>\n\n"
+            "Use /help to see all available commands."
+        )
+
+        await query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="panel_back",
+                    )
+                ]
+            ]),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # ROSE
+    # --------------------------------------------------------
+
+    if data == "rose_menu":
+
+        await rose_menu(query)
+        return
+
+    # --------------------------------------------------------
+    # PANEL BACK
+    # --------------------------------------------------------
+
+    if data == "panel_back":
+
+        await query.message.edit_text(
+            "👑 <b>OWNER CONTROL PANEL</b>\n\n"
+            "🛡️ JoinGuard Bot\n\n"
+            "Select an option below:",
+            reply_markup=panel_keyboard(),
+            parse_mode="HTML",
+        )
+
+
+# ============================================================
+# ID
+# ============================================================
+
+async def id_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    await update.effective_message.reply_text(
+        f"🆔 <b>Your User ID:</b> "
+        f"<code>{user.id}</code>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# INFO
+# ============================================================
+
+async def info_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user = update.effective_user
+
+    if not user:
+        return
 
     username = (
         f"@{user.username}"
@@ -663,246 +1771,12 @@ async def request_again(
         else "No username"
     )
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "✅ Approve",
-                callback_data=f"approve:{user.id}",
-            ),
-            InlineKeyboardButton(
-                "❌ Reject",
-                callback_data=f"reject:{user.id}",
-            ),
-        ]
-    ]
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                "📩 <b>New Access Request</b>\n\n"
-                f"👤 Name: {html.escape(user.first_name or '')}\n"
-                f"🔗 Username: {username}\n"
-                f"🆔 ID: <code>{user.id}</code>"
-            ),
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
-            ),
-            parse_mode="HTML",
-        )
-
-    except Exception as exc:
-
-        logger.error(
-            "Failed to notify owner: %s",
-            exc,
-        )
-
-
-# ============================================================
-# APPROVAL
-# ============================================================
-
-async def process_approval(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    query = update.callback_query
-
-    if not is_owner(query.from_user.id):
-
-        await query.answer(
-            "❌ Owner only!",
-            show_alert=True,
-        )
-
-        return
-
-    action, user_id_text = query.data.split(":")
-
-    user_id = int(user_id_text)
-
-    if action == "approve":
-
-        database.set_approval(
-            user_id,
-            1,
-        )
-
-        await query.answer(
-            "✅ Approved",
-            show_alert=True,
-        )
-
-        await query.edit_message_text(
-            "✅ <b>User Approved</b>\n\n"
-            f"🆔 <code>{user_id}</code>",
-            parse_mode="HTML",
-        )
-
-        try:
-
-            await context.bot.send_message(
-                user_id,
-                "🎉 <b>Access Approved!</b>\n\n"
-                "You can now join all required "
-                "channels and use /start.",
-                parse_mode="HTML",
-            )
-
-        except Exception:
-            pass
-
-    elif action == "reject":
-
-        database.set_approval(
-            user_id,
-            -1,
-        )
-
-        await query.answer(
-            "❌ Rejected",
-            show_alert=True,
-        )
-
-        await query.edit_message_text(
-            "❌ <b>User Rejected</b>\n\n"
-            f"🆔 <code>{user_id}</code>",
-            parse_mode="HTML",
-        )
-
-
-# ============================================================
-# REVOKE
-# ============================================================
-
-async def revoke_user(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update.effective_user.id):
-
-        await update.message.reply_text(
-            "❌ Owner only.",
-        )
-
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage:\n"
-            "<code>/revoke USER_ID</code>",
-            parse_mode="HTML",
-        )
-
-        return
-
-    try:
-
-        user_id = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Invalid user ID.",
-        )
-
-        return
-
-    database.set_approval(
-        user_id,
-        -1,
+    text = (
+        "👤 <b>USER INFORMATION</b>\n\n"
+        f"📝 Name: {user.first_name}\n"
+        f"🔗 Username: {username}\n"
+        f"🆔 ID: <code>{user.id}</code>"
     )
-
-    database.set_verified(
-        user_id,
-        False,
-    )
-
-    await update.message.reply_text(
-        "🚫 <b>Access Revoked</b>\n\n"
-        f"👤 User ID: <code>{user_id}</code>",
-        parse_mode="HTML",
-    )
-
-    try:
-
-        await context.bot.send_message(
-            user_id,
-            "🚫 <b>Your bot access has been revoked.</b>",
-            parse_mode="HTML",
-        )
-
-    except Exception:
-        pass
-
-
-# ============================================================
-# HELP
-# ============================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if update.effective_chat.type == ChatType.PRIVATE:
-
-        text = (
-            f"🛡️ <b>{BOT_NAME}</b>\n\n"
-            "👤 <b>User</b>\n"
-            "/start\n"
-            "/help\n\n"
-        )
-
-        if is_owner(update.effective_user.id):
-
-            text += (
-                "👑 <b>Owner</b>\n"
-                "/panel\n"
-                "/requests\n"
-                "/stats\n"
-                "/channels\n"
-                "/revoke USER_ID\n"
-            )
-
-    else:
-
-        text = (
-            f"🛡️ <b>{BOT_NAME}</b>\n\n"
-            "🛡️ <b>Moderation</b>\n"
-            "/warn\n"
-            "/unwarn\n"
-            "/warnings\n"
-            "/ban\n"
-            "/unban\n"
-            "/mute\n"
-            "/unmute\n"
-            "/kick\n"
-            "/purge\n"
-            "/promote\n"
-            "/demote\n\n"
-            "🔒 <b>Locks</b>\n"
-            "/lock\n"
-            "/unlock\n"
-            "/locks\n\n"
-            "📜 <b>Group</b>\n"
-            "/rules\n"
-            "/setrules\n"
-            "/welcome\n"
-            "/goodbye\n\n"
-            "🌐 <b>Federation</b>\n"
-            "/newfed NAME\n"
-            "/joinfed FED_ID\n"
-            "/fban\n"
-            "/funban\n"
-            "/fmute\n"
-            "/funmute\n"
-        )
 
     await update.effective_message.reply_text(
         text,
@@ -911,58 +1785,292 @@ async def help_command(
 
 
 # ============================================================
-# WARN
+# RULES
 # ============================================================
 
-async def warn(
+async def rules_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
+    chat = update.effective_chat
+
+    if not chat:
         return
 
-    target = await resolve_user(
+    settings = database.get_group_settings(
+        chat.id
+    )
+
+    rules = settings[4]
+
+    await update.effective_message.reply_text(
+        f"<b>📜 GROUP RULES</b>\n\n{rules}",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# WELCOME
+# ============================================================
+
+async def welcome_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not await is_admin(update):
+
+        await update.effective_message.reply_text(
+            "❌ Admins only."
+        )
+
+        return
+
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+
+        settings = database.get_group_settings(
+            chat_id
+        )
+
+        enabled = bool(settings[0])
+
+        await update.effective_message.reply_text(
+            f"👋 Welcome system: "
+            f"<b>{'ON' if enabled else 'OFF'}</b>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    option = context.args[0].lower()
+
+    if option == "on":
+
+        database.set_welcome(
+            chat_id,
+            True,
+        )
+
+        await update.effective_message.reply_text(
+            "✅ Welcome messages enabled."
+        )
+
+    elif option == "off":
+
+        database.set_welcome(
+            chat_id,
+            False,
+        )
+
+        await update.effective_message.reply_text(
+            "❌ Welcome messages disabled."
+        )
+
+
+# ============================================================
+# GOODBYE
+# ============================================================
+
+async def goodbye_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not await is_admin(update):
+
+        await update.effective_message.reply_text(
+            "❌ Admins only."
+        )
+
+        return
+
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+
+        settings = database.get_group_settings(
+            chat_id
+        )
+
+        enabled = bool(settings[2])
+
+        await update.effective_message.reply_text(
+            f"👋 Goodbye system: "
+            f"<b>{'ON' if enabled else 'OFF'}</b>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    option = context.args[0].lower()
+
+    if option == "on":
+
+        database.set_goodbye(
+            chat_id,
+            True,
+        )
+
+        await update.effective_message.reply_text(
+            "✅ Goodbye messages enabled."
+        )
+
+    elif option == "off":
+
+        database.set_goodbye(
+            chat_id,
+            False,
+        )
+
+        await update.effective_message.reply_text(
+            "❌ Goodbye messages disabled."
+        )
+
+
+# ============================================================
+# NEW MEMBER
+# ============================================================
+
+async def new_member(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not update.chat_member:
+        return
+
+    result = update.chat_member
+
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+
+    if new_status not in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.RESTRICTED,
+    ):
+        return
+
+    if old_status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.RESTRICTED,
+    ):
+        return
+
+    user = result.new_chat_member.user
+    chat = update.effective_chat
+
+    database.ensure_group(
+        chat.id
+    )
+
+    settings = database.get_group_settings(
+        chat.id
+    )
+
+    if not bool(settings[0]):
+        return
+
+    text = settings[1].format(
+        mention=mention_user(user),
+        name=user.first_name or "User",
+        username=(
+            f"@{user.username}"
+            if user.username
+            else ""
+        ),
+        id=user.id,
+        chatname=chat.title or "",
+    )
+
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=text,
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# TARGET USER
+# ============================================================
+
+async def get_target_user(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if (
+        update.message
+        and update.message.reply_to_message
+    ):
+
+        return update.message.reply_to_message.from_user
+
+    if context.args:
+
+        try:
+
+            user_id = int(
+                context.args[0]
+            )
+
+            member = await context.bot.get_chat_member(
+                update.effective_chat.id,
+                user_id,
+            )
+
+            return member.user
+
+        except Exception:
+
+            return None
+
+    return None
+
+
+# ============================================================
+# WARN
+# ============================================================
+
+async def warn_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not await is_admin(update):
+
+        await update.effective_message.reply_text(
+            "❌ Admins only."
+        )
+
+        return
+
+    target = await get_target_user(
         update,
         context,
     )
 
     if not target:
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Reply to a user or use:\n"
-            "/warn USER_ID",
-        )
-
-        return
-
-    user = target.user
-
-    if user.id == update.effective_user.id:
-
-        await update.message.reply_text(
-            "❌ You cannot warn yourself.",
+            "/warn USER_ID"
         )
 
         return
 
     count = database.add_warn(
         update.effective_chat.id,
-        user.id,
+        target.id,
     )
 
     settings = database.get_group_settings(
         update.effective_chat.id
     )
 
-    limit = settings[5] if settings else 3
-
-    await update.message.reply_text(
-        f"⚠️ <b>Warning</b>\n\n"
-        f"👤 {html.escape(user.first_name)}\n"
-        f"⚠️ Warnings: <b>{count}/{limit}</b>",
-        parse_mode="HTML",
-    )
+    limit = settings[5]
 
     if count >= limit:
 
@@ -970,100 +2078,75 @@ async def warn(
 
             await context.bot.ban_chat_member(
                 update.effective_chat.id,
-                user.id,
+                target.id,
             )
 
             database.reset_warns(
                 update.effective_chat.id,
-                user.id,
+                target.id,
             )
 
-            await update.message.reply_text(
-                f"🚫 <b>{html.escape(user.first_name)}</b> "
-                f"has been banned after reaching "
-                f"{limit} warnings.",
+            await update.effective_message.reply_text(
+                f"🔨 {mention_user(target)} "
+                f"was banned after {limit} warnings.",
                 parse_mode="HTML",
             )
 
-        except Exception as exc:
+        except Exception as e:
 
-            logger.error(
-                "Auto-ban failed: %s",
-                exc,
+            await update.effective_message.reply_text(
+                f"❌ Could not ban user.\n\n"
+                f"<code>{e}</code>",
+                parse_mode="HTML",
             )
+
+        return
+
+    await update.effective_message.reply_text(
+        f"⚠️ {mention_user(target)} received a warning.\n\n"
+        f"Warnings: <b>{count}/{limit}</b>",
+        parse_mode="HTML",
+    )
 
 
 # ============================================================
 # UNWARN
 # ============================================================
 
-async def unwarn(
+async def unwarn_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
+    if not await is_admin(update):
+
+        await update.effective_message.reply_text(
+            "❌ Admins only."
+        )
+
         return
 
-    target = await resolve_user(
+    target = await get_target_user(
         update,
         context,
     )
 
     if not target:
 
-        await update.message.reply_text(
-            "Reply to a user or provide USER_ID.",
+        await update.effective_message.reply_text(
+            "Reply to a user or use /unwarn USER_ID"
         )
 
         return
 
     database.reset_warns(
         update.effective_chat.id,
-        target.user.id,
+        target.id,
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"✅ Warnings reset for "
-        f"<b>{html.escape(target.user.first_name)}</b>.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# WARNINGS
-# ============================================================
-
-async def warnings(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    target = await resolve_user(
-        update,
-        context,
-    )
-
-    if not target:
-
-        if update.message.reply_to_message:
-            user = update.message.reply_to_message.from_user
-        else:
-            user = update.effective_user
-
-    else:
-        user = target.user
-
-    count = database.get_warns(
-        update.effective_chat.id,
-        user.id,
-    )
-
-    await update.message.reply_text(
-        f"⚠️ <b>Warnings</b>\n\n"
-        f"👤 {html.escape(user.first_name)}\n"
-        f"🆔 <code>{user.id}</code>\n"
-        f"⚠️ Warnings: <b>{count}</b>",
+        f"{mention_user(target)}.",
         parse_mode="HTML",
     )
 
@@ -1072,23 +2155,28 @@ async def warnings(
 # BAN
 # ============================================================
 
-async def ban(
+async def ban_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
+    if not await is_admin(update):
+
+        await update.effective_message.reply_text(
+            "❌ Admins only."
+        )
+
         return
 
-    target = await resolve_user(
+    target = await get_target_user(
         update,
         context,
     )
 
     if not target:
 
-        await update.message.reply_text(
-            "Reply to a user or use /ban USER_ID.",
+        await update.effective_message.reply_text(
+            "Reply to a user or use /ban USER_ID"
         )
 
         return
@@ -1097,19 +2185,19 @@ async def ban(
 
         await context.bot.ban_chat_member(
             update.effective_chat.id,
-            target.user.id,
+            target.id,
         )
 
-        await update.message.reply_text(
-            f"🚫 <b>{html.escape(target.user.first_name)}</b> "
-            "has been banned.",
+        await update.effective_message.reply_text(
+            f"🔨 {mention_user(target)} has been banned.",
             parse_mode="HTML",
         )
 
-    except Exception as exc:
+    except Exception as e:
 
-        await update.message.reply_text(
-            f"❌ Ban failed:\n<code>{html.escape(str(exc))}</code>",
+        await update.effective_message.reply_text(
+            f"❌ Ban failed.\n\n"
+            f"<code>{e}</code>",
             parse_mode="HTML",
         )
 
@@ -1118,47 +2206,49 @@ async def ban(
 # UNBAN
 # ============================================================
 
-async def unban(
+async def unban_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
+    if not await is_admin(update):
+
+        await update.effective_message.reply_text(
+            "❌ Admins only."
+        )
+
         return
 
     if not context.args:
 
-        await update.message.reply_text(
-            "Usage: /unban USER_ID",
+        await update.effective_message.reply_text(
+            "Usage:\n/unban USER_ID"
         )
 
         return
 
     try:
-        user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid user ID."
-        )
-        return
 
-    try:
+        user_id = int(
+            context.args[0]
+        )
 
         await context.bot.unban_chat_member(
             update.effective_chat.id,
             user_id,
-            only_if_banned=True,
         )
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"✅ User <code>{user_id}</code> unbanned.",
             parse_mode="HTML",
         )
 
-    except Exception as exc:
+    except Exception as e:
 
-        await update.message.reply_text(
-            f"❌ Unban failed:\n{html.escape(str(exc))}",
+        await update.effective_message.reply_text(
+            f"❌ Unban failed.\n\n"
+            f"<code>{e}</code>",
+            parse_mode="HTML",
         )
 
 
@@ -1166,23 +2256,28 @@ async def unban(
 # MUTE
 # ============================================================
 
-async def mute(
+async def mute_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
+    if not await is_admin(update):
+
+        await update.effective_message.reply_text(
+            "❌ Admins only."
+        )
+
         return
 
-    target = await resolve_user(
+    target = await get_target_user(
         update,
         context,
     )
 
     if not target:
 
-        await update.message.reply_text(
-            "Reply to a user or use /mute USER_ID.",
+        await update.effective_message.reply_text(
+            "Reply to a user or use /mute USER_ID"
         )
 
         return
@@ -1191,73 +2286,62 @@ async def mute(
 
         await context.bot.restrict_chat_member(
             update.effective_chat.id,
-            target.user.id,
-            permissions={
-                "can_send_messages": False,
-            },
+            target.id,
+            permissions=ChatPermissions(
+                can_send_messages=False
+            ),
         )
 
-    except Exception:
+        await update.effective_message.reply_text(
+            f"🔇 {mention_user(target)} "
+            "has been muted.",
+            parse_mode="HTML",
+        )
 
-        from telegram import ChatPermissions
+    except Exception as e:
 
-        try:
-
-            await context.bot.restrict_chat_member(
-                update.effective_chat.id,
-                target.user.id,
-                permissions=ChatPermissions(
-                    can_send_messages=False,
-                ),
-            )
-
-        except Exception as exc:
-
-            await update.message.reply_text(
-                f"❌ Mute failed:\n{html.escape(str(exc))}",
-                parse_mode="HTML",
-            )
-
-            return
-
-    await update.message.reply_text(
-        f"🔇 <b>{html.escape(target.user.first_name)}</b> muted.",
-        parse_mode="HTML",
-    )
+        await update.effective_message.reply_text(
+            f"❌ Mute failed.\n\n"
+            f"<code>{e}</code>",
+            parse_mode="HTML",
+        )
 
 
 # ============================================================
 # UNMUTE
 # ============================================================
 
-async def unmute(
+async def unmute_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
+    if not await is_admin(update):
+
+        await update.effective_message.reply_text(
+            "❌ Admins only."
+        )
+
         return
 
-    target = await resolve_user(
+    target = await get_target_user(
         update,
         context,
     )
 
     if not target:
 
-        await update.message.reply_text(
-            "Reply to a user or use /unmute USER_ID.",
+        await update.effective_message.reply_text(
+            "Reply to a user or use /unmute USER_ID"
         )
 
         return
-
-    from telegram import ChatPermissions
 
     try:
 
         await context.bot.restrict_chat_member(
             update.effective_chat.id,
-            target.user.id,
+            target.id,
             permissions=ChatPermissions(
                 can_send_messages=True,
                 can_send_audios=True,
@@ -1272,65 +2356,17 @@ async def unmute(
             ),
         )
 
-        await update.message.reply_text(
-            f"🔊 <b>{html.escape(target.user.first_name)}</b> unmuted.",
+        await update.effective_message.reply_text(
+            f"🔊 {mention_user(target)} "
+            "has been unmuted.",
             parse_mode="HTML",
         )
 
-    except Exception as exc:
+    except Exception as e:
 
-        await update.message.reply_text(
-            f"❌ Unmute failed:\n{html.escape(str(exc))}",
-            parse_mode="HTML",
-        )
-
-
-# ============================================================
-# KICK
-# ============================================================
-
-async def kick(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    target = await resolve_user(
-        update,
-        context,
-    )
-
-    if not target:
-
-        await update.message.reply_text(
-            "Reply to a user or use /kick USER_ID.",
-        )
-
-        return
-
-    try:
-
-        await context.bot.ban_chat_member(
-            update.effective_chat.id,
-            target.user.id,
-        )
-
-        await context.bot.unban_chat_member(
-            update.effective_chat.id,
-            target.user.id,
-        )
-
-        await update.message.reply_text(
-            f"👢 <b>{html.escape(target.user.first_name)}</b> kicked.",
-            parse_mode="HTML",
-        )
-
-    except Exception as exc:
-
-        await update.message.reply_text(
-            f"❌ Kick failed:\n{html.escape(str(exc))}",
+        await update.effective_message.reply_text(
+            f"❌ Unmute failed.\n\n"
+            f"<code>{e}</code>",
             parse_mode="HTML",
         )
 
@@ -1339,52 +2375,102 @@ async def kick(
 # PURGE
 # ============================================================
 
-async def purge(
+async def purge_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
-        return
+    if not await is_admin(update):
 
-    message = update.effective_message
-
-    if not message.reply_to_message:
-
-        await message.reply_text(
-            "Reply to the first message and use /purge.",
+        await update.effective_message.reply_text(
+            "❌ Admins only."
         )
 
         return
 
-    start_id = message.reply_to_message.message_id
-    end_id = message.message_id
+    if not context.args:
 
-    deleted = 0
+        await update.effective_message.reply_text(
+            "Usage:\n/purge 10"
+        )
 
-    for message_id in range(
-        start_id,
-        end_id + 1,
-    ):
-
-        try:
-
-            await context.bot.delete_message(
-                update.effective_chat.id,
-                message_id,
-            )
-
-            deleted += 1
-
-        except Exception:
-            pass
+        return
 
     try:
 
-        await context.bot.send_message(
+        amount = int(
+            context.args[0]
+        )
+
+        if amount < 1 or amount > 100:
+
+            await update.effective_message.reply_text(
+                "Enter a number between 1 and 100."
+            )
+
+            return
+
+        if not update.message:
+            return
+
+        message_id = update.message.message_id
+
+        deleted = 0
+
+        for msg_id in range(
+            message_id,
+            max(0, message_id - amount),
+            -1,
+        ):
+
+            try:
+
+                await context.bot.delete_message(
+                    update.effective_chat.id,
+                    msg_id,
+                )
+
+                deleted += 1
+
+            except Exception:
+                pass
+
+        msg = await context.bot.send_message(
             update.effective_chat.id,
-            f"🧹 Purged <b>{deleted}</b> messages.",
+            f"🧹 Deleted {deleted} messages.",
+        )
+
+        if context.job_queue:
+
+            context.job_queue.run_once(
+                delete_message_job,
+                5,
+                data=(
+                    update.effective_chat.id,
+                    msg.message_id,
+                ),
+            )
+
+    except Exception as e:
+
+        await update.effective_message.reply_text(
+            f"❌ Purge failed.\n\n"
+            f"<code>{e}</code>",
             parse_mode="HTML",
+        )
+
+
+async def delete_message_job(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat_id, message_id = context.job.data
+
+    try:
+
+        await context.bot.delete_message(
+            chat_id,
+            message_id,
         )
 
     except Exception:
@@ -1392,271 +2478,27 @@ async def purge(
 
 
 # ============================================================
-# PROMOTE
+# LOCK
 # ============================================================
 
-async def promote(
+async def lock_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
-        return
+    if not await is_admin(update):
 
-    target = await resolve_user(
-        update,
-        context,
-    )
-
-    if not target:
-
-        await update.message.reply_text(
-            "Reply to a user or use /promote USER_ID.",
+        await update.effective_message.reply_text(
+            "❌ Admins only."
         )
 
         return
 
-    try:
-
-        await context.bot.promote_chat_member(
-            update.effective_chat.id,
-            target.user.id,
-            can_manage_chat=True,
-            can_delete_messages=True,
-            can_manage_video_chats=True,
-            can_restrict_members=True,
-            can_promote_members=False,
-            can_change_info=False,
-            can_invite_users=True,
-            can_pin_messages=True,
-        )
-
-        await update.message.reply_text(
-            f"👑 <b>{html.escape(target.user.first_name)}</b> promoted.",
-            parse_mode="HTML",
-        )
-
-    except Exception as exc:
-
-        await update.message.reply_text(
-            f"❌ Promote failed:\n{html.escape(str(exc))}",
-            parse_mode="HTML",
-        )
-
-
-# ============================================================
-# DEMOTE
-# ============================================================
-
-async def demote(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    target = await resolve_user(
-        update,
-        context,
-    )
-
-    if not target:
-
-        await update.message.reply_text(
-            "Reply to a user or use /demote USER_ID.",
-        )
-
-        return
-
-    try:
-
-        await context.bot.promote_chat_member(
-            update.effective_chat.id,
-            target.user.id,
-            can_manage_chat=False,
-            can_delete_messages=False,
-            can_manage_video_chats=False,
-            can_restrict_members=False,
-            can_promote_members=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False,
-        )
-
-        await update.message.reply_text(
-            f"⬇️ <b>{html.escape(target.user.first_name)}</b> demoted.",
-            parse_mode="HTML",
-        )
-
-    except Exception as exc:
-
-        await update.message.reply_text(
-            f"❌ Demote failed:\n{html.escape(str(exc))}",
-            parse_mode="HTML",
-        )
-
-
-# ============================================================
-# RULES
-# ============================================================
-
-async def rules(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    settings = database.get_group_settings(
-        update.effective_chat.id
-    )
-
-    text = settings[4] if settings else None
-
-    if not text:
-        text = database.DEFAULT_RULES
-
-    await update.effective_message.reply_text(
-        f"📜 <b>Group Rules</b>\n\n{html.escape(text)}",
-        parse_mode="HTML",
-    )
-
-
-async def setrules(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage:\n"
-            "<code>/setrules Your rules here</code>",
-            parse_mode="HTML",
-        )
-
-        return
-
-    text = " ".join(context.args)
-
-    database.set_rules(
-        update.effective_chat.id,
-        text,
-    )
-
-    await update.message.reply_text(
-        "✅ Group rules updated.",
-    )
-
-
-# ============================================================
-# WELCOME / GOODBYE
-# ============================================================
-
-async def welcome(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    settings = database.get_group_settings(
-        update.effective_chat.id
-    )
-
-    enabled = bool(settings[0])
-
-    database.set_welcome(
-        update.effective_chat.id,
-        not enabled,
-    )
-
-    status = "enabled" if not enabled else "disabled"
-
-    await update.message.reply_text(
-        f"👋 Welcome messages <b>{status}</b>.",
-        parse_mode="HTML",
-    )
-
-
-async def goodbye(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    settings = database.get_group_settings(
-        update.effective_chat.id
-    )
-
-    enabled = bool(settings[2])
-
-    database.set_goodbye(
-        update.effective_chat.id,
-        not enabled,
-    )
-
-    status = "enabled" if not enabled else "disabled"
-
-    await update.message.reply_text(
-        f"👋 Goodbye messages <b>{status}</b>.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# LOCKS
-# ============================================================
-
-LOCK_TYPES = {
-    "links": "links",
-    "link": "links",
-    "url": "links",
-    "username": "username",
-    "usernames": "username",
-    "bio": "bio",
-    "bots": "bots",
-    "forward": "forward",
-}
-
-
-async def lock(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage:\n"
-            "/lock links\n"
-            "/lock username\n"
-            "/lock bio\n"
-            "/lock bots\n"
-            "/lock forward",
-        )
-
-        return
-
-    lock_type = LOCK_TYPES.get(
+    lock_type = (
         context.args[0].lower()
+        if context.args
+        else "messages"
     )
-
-    if not lock_type:
-
-        await update.message.reply_text(
-            "❌ Unknown lock type.",
-        )
-
-        return
 
     database.set_lock(
         update.effective_chat.id,
@@ -1664,39 +2506,34 @@ async def lock(
         True,
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"🔒 <b>{lock_type}</b> lock enabled.",
         parse_mode="HTML",
     )
 
 
-async def unlock(
+# ============================================================
+# UNLOCK
+# ============================================================
+
+async def unlock_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await require_admin(update, context):
-        return
+    if not await is_admin(update):
 
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage: /unlock links",
+        await update.effective_message.reply_text(
+            "❌ Admins only."
         )
 
         return
 
-    lock_type = LOCK_TYPES.get(
+    lock_type = (
         context.args[0].lower()
+        if context.args
+        else "messages"
     )
-
-    if not lock_type:
-
-        await update.message.reply_text(
-            "❌ Unknown lock type.",
-        )
-
-        return
 
     database.set_lock(
         update.effective_chat.id,
@@ -1704,726 +2541,48 @@ async def unlock(
         False,
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"🔓 <b>{lock_type}</b> lock disabled.",
         parse_mode="HTML",
     )
 
 
-async def locks(
+# ============================================================
+# SET RULES
+# ============================================================
+
+async def setrules_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    active = database.get_locks(
-        update.effective_chat.id
-    )
+    if not await is_admin(update):
 
-    if not active:
-
-        await update.message.reply_text(
-            "🔓 No locks are enabled.",
+        await update.effective_message.reply_text(
+            "❌ Admins only."
         )
 
-        return
-
-    text = "\n".join(
-        f"🔒 {item}"
-        for item in active
-    )
-
-    await update.message.reply_text(
-        f"🔐 <b>Active Locks</b>\n\n{text}",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# NEW FEDERATION
-# ============================================================
-
-async def newfed(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    user = update.effective_user
-
-    if not is_owner(user.id) and not await is_admin(
-        update,
-        context,
-    ):
-        await update.message.reply_text(
-            "❌ Admins only.",
-        )
         return
 
     if not context.args:
 
-        await update.message.reply_text(
-            "Usage:\n"
-            "<code>/newfed Federation Name</code>",
-            parse_mode="HTML",
+        await update.effective_message.reply_text(
+            "Usage:\n/setrules Your rules here"
         )
 
         return
 
-    name = " ".join(context.args)
-
-    fed_id = f"{user.id}_{update.effective_chat.id}"
-
-    database.create_federation(
-        fed_id,
-        name,
-        user.id,
+    rules = " ".join(
+        context.args
     )
 
-    database.add_fed_chat(
-        fed_id,
+    database.set_rules(
         update.effective_chat.id,
+        rules,
     )
 
-    await update.message.reply_text(
-        "🌐 <b>Federation Created</b>\n\n"
-        f"📛 Name: {html.escape(name)}\n"
-        f"🆔 ID: <code>{fed_id}</code>\n\n"
-        "Use this ID with /joinfed.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# JOIN FEDERATION
-# ============================================================
-
-async def joinfed(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage:\n"
-            "<code>/joinfed FED_ID</code>",
-            parse_mode="HTML",
-        )
-
-        return
-
-    fed_id = context.args[0]
-
-    fed = database.get_federation(
-        fed_id
-    )
-
-    if not fed:
-
-        await update.message.reply_text(
-            "❌ Federation not found.",
-        )
-
-        return
-
-    database.add_fed_chat(
-        fed_id,
-        update.effective_chat.id,
-    )
-
-    await update.message.reply_text(
-        "🌐 <b>Federation Joined</b>\n\n"
-        f"📛 {html.escape(fed[1])}\n"
-        f"🆔 <code>{fed_id}</code>",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# FED BAN
-# ============================================================
-
-async def fban(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Usage:\n"
-            "/fban USER_ID FED_ID",
-        )
-
-        return
-
-    try:
-
-        user_id = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Invalid user ID.",
-        )
-
-        return
-
-    fed_id = (
-        context.args[1]
-        if len(context.args) > 1
-        else None
-    )
-
-    if not fed_id:
-
-        await update.message.reply_text(
-            "❌ Provide FED_ID.",
-        )
-
-        return
-
-    if not database.get_federation(fed_id):
-
-        await update.message.reply_text(
-            "❌ Federation not found.",
-        )
-
-        return
-
-    database.fed_ban(
-        fed_id,
-        user_id,
-    )
-
-    try:
-
-        await context.bot.ban_chat_member(
-            update.effective_chat.id,
-            user_id,
-        )
-
-    except Exception:
-        pass
-
-    await update.message.reply_text(
-        f"🌐🚫 User <code>{user_id}</code> "
-        f"federation-banned.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# FED UNBAN
-# ============================================================
-
-async def funban(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            "/funban USER_ID FED_ID",
-        )
-
-        return
-
-    try:
-
-        user_id = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Invalid user ID.",
-        )
-
-        return
-
-    fed_id = context.args[1]
-
-    database.fed_unban(
-        fed_id,
-        user_id,
-    )
-
-    try:
-
-        await context.bot.unban_chat_member(
-            update.effective_chat.id,
-            user_id,
-            only_if_banned=True,
-        )
-
-    except Exception:
-        pass
-
-    await update.message.reply_text(
-        f"✅ User <code>{user_id}</code> "
-        "removed from federation ban.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# FED MUTE
-# ============================================================
-
-async def fmute(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            "/fmute USER_ID FED_ID",
-        )
-
-        return
-
-    try:
-
-        user_id = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Invalid user ID.",
-        )
-
-        return
-
-    fed_id = context.args[1]
-
-    database.fed_mute(
-        fed_id,
-        user_id,
-    )
-
-    try:
-
-        from telegram import ChatPermissions
-
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id,
-            user_id,
-            permissions=ChatPermissions(
-                can_send_messages=False,
-            ),
-        )
-
-    except Exception:
-        pass
-
-    await update.message.reply_text(
-        f"🌐🔇 User <code>{user_id}</code> "
-        "federation-muted.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# FED UNMUTE
-# ============================================================
-
-async def funmute(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await require_admin(update, context):
-        return
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            "/funmute USER_ID FED_ID",
-        )
-
-        return
-
-    try:
-
-        user_id = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Invalid user ID.",
-        )
-
-        return
-
-    fed_id = context.args[1]
-
-    database.fed_unmute(
-        fed_id,
-        user_id,
-    )
-
-    try:
-
-        from telegram import ChatPermissions
-
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id,
-            user_id,
-            permissions=ChatPermissions(
-                can_send_messages=True,
-            ),
-        )
-
-    except Exception:
-        pass
-
-    await update.message.reply_text(
-        f"✅ User <code>{user_id}</code> "
-        "removed from federation mute.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# MESSAGE RESTRICTIONS
-# ============================================================
-
-URL_REGEX = re.compile(
-    r"(https?://|www\.|t\.me/|telegram\.me/)",
-    re.IGNORECASE,
-)
-
-
-async def moderation_filter(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    message = update.effective_message
-    user = update.effective_user
-    chat = update.effective_chat
-
-    if not message or not user or not chat:
-        return
-
-    if chat.type == ChatType.PRIVATE:
-        return
-
-    # Never moderate admins
-    if await is_admin(update, context):
-        return
-
-    text = message.text or message.caption or ""
-
-    # --------------------------------------------------------
-    # LINKS
-    # --------------------------------------------------------
-
-    if database.is_locked(
-        chat.id,
-        "links",
-    ):
-
-        if URL_REGEX.search(text):
-
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
-            return
-
-    # --------------------------------------------------------
-    # FORWARDED MESSAGES
-    # --------------------------------------------------------
-
-    if database.is_locked(
-        chat.id,
-        "forward",
-    ):
-
-        if message.forward_origin:
-
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
-            return
-
-    # --------------------------------------------------------
-    # BOTS
-    # --------------------------------------------------------
-
-    if database.is_locked(
-        chat.id,
-        "bots",
-    ):
-
-        if user.is_bot:
-
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
-            return
-
-
-# ============================================================
-# NEW MEMBER WELCOME
-# ============================================================
-
-async def new_member(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    settings = database.get_group_settings(
-        update.effective_chat.id
-    )
-
-    if not settings:
-        return
-
-    if not settings[0]:
-        return
-
-    for user in message.new_chat_members:
-
-        mention = (
-            f'<a href="tg://user?id={user.id}">'
-            f'{html.escape(user.first_name)}'
-            f'</a>'
-        )
-
-        text = settings[1] or database.DEFAULT_WELCOME
-
-        text = text.replace(
-            "{mention}",
-            mention,
-        )
-
-        text = text.replace(
-            "{name}",
-            html.escape(user.first_name),
-        )
-
-        text = text.replace(
-            "{chatname}",
-            html.escape(
-                update.effective_chat.title or ""
-            ),
-        )
-
-        await message.reply_text(
-            text,
-            parse_mode="HTML",
-        )
-
-
-# ============================================================
-# GOODBYE
-# ============================================================
-
-async def left_member(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    message = update.effective_message
-
-    if not message:
-        return
-
-    member = message.left_chat_member
-
-    if not member:
-        return
-
-    settings = database.get_group_settings(
-        update.effective_chat.id
-    )
-
-    if not settings or not settings[2]:
-        return
-
-    text = settings[3] or database.DEFAULT_GOODBYE
-
-    text = text.replace(
-        "{name}",
-        html.escape(member.first_name),
-    )
-
-    await message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# CHANNELS
-# ============================================================
-
-async def channels(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update.effective_user.id):
-
-        await update.message.reply_text(
-            "❌ Owner only.",
-        )
-
-        return
-
-    text = "📢 <b>Force Join Channels</b>\n\n"
-
-    for index, channel_id in enumerate(
-        FORCE_JOIN_CHANNELS,
-        start=1,
-    ):
-
-        title, invite = await get_channel_button(
-            context,
-            channel_id,
-            index,
-        )
-
-        text += (
-            f"{index}. <b>{html.escape(title)}</b>\n"
-            f"ID: <code>{channel_id}</code>\n"
-        )
-
-        if invite:
-            text += f"{invite}\n"
-
-        text += "\n"
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# STATS
-# ============================================================
-
-async def stats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update.effective_user.id):
-
-        await update.message.reply_text(
-            "❌ Owner only.",
-        )
-
-        return
-
-    await update.message.reply_text(
-        "📊 <b>Bot Statistics</b>\n\n"
-        f"👥 Users: <b>{database.get_user_count()}</b>\n"
-        f"✅ Verified: <b>{database.get_verified_count()}</b>\n"
-        f"🟢 Approved: <b>{database.get_approved_count()}</b>\n"
-        f"⏳ Pending: <b>{database.get_pending_count()}</b>",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# REQUESTS
-# ============================================================
-
-async def requests(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not is_owner(update.effective_user.id):
-
-        await update.message.reply_text(
-            "❌ Owner only.",
-        )
-
-        return
-
-    pending = database.get_pending_users()
-
-    if not pending:
-
-        await update.message.reply_text(
-            "✅ No pending requests.",
-        )
-
-        return
-
-    for user_id, first_name, username in pending:
-
-        username_text = (
-            f"@{username}"
-            if username
-            else "No username"
-        )
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "✅ Approve",
-                    callback_data=f"approve:{user_id}",
-                ),
-                InlineKeyboardButton(
-                    "❌ Reject",
-                    callback_data=f"reject:{user_id}",
-                ),
-            ]
-        ]
-
-        await update.message.reply_text(
-            "📩 <b>Pending Request</b>\n\n"
-            f"👤 {html.escape(first_name)}\n"
-            f"🔗 {username_text}\n"
-            f"🆔 <code>{user_id}</code>",
-            reply_markup=InlineKeyboardMarkup(
-                keyboard
-            ),
-            parse_mode="HTML",
-        )
-
-
-# ============================================================
-# NO LINK CALLBACK
-# ============================================================
-
-async def no_link(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.callback_query.answer(
-        "Please use the channel link provided by the bot.",
-        show_alert=True,
+    await update.effective_message.reply_text(
+        "✅ Group rules updated."
     )
 
 
@@ -2449,7 +2608,7 @@ async def error_handler(
 def main():
 
     print("🚀 Starting Force Join Bot...")
-    print()
+    print("✅ Initializing database...")
 
     application = (
         Application.builder()
@@ -2475,84 +2634,64 @@ def main():
         )
     )
 
+    application.add_handler(
+        CommandHandler(
+            "id",
+            id_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "info",
+            info_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "rules",
+            rules_command,
+        )
+    )
+
     # --------------------------------------------------------
     # OWNER
     # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
+            "panel",
+            panel,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "approve",
+            approve_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "reject",
+            reject_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
             "revoke",
-            revoke_user,
+            revoke_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            "stats",
-            stats,
+            "reapprove",
+            reapprove_command,
         )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "requests",
-            requests,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "channels",
-            channels,
-        )
-    )
-
-    # --------------------------------------------------------
-    # MODERATION
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CommandHandler("warn", warn)
-    )
-
-    application.add_handler(
-        CommandHandler("unwarn", unwarn)
-    )
-
-    application.add_handler(
-        CommandHandler("warnings", warnings)
-    )
-
-    application.add_handler(
-        CommandHandler("ban", ban)
-    )
-
-    application.add_handler(
-        CommandHandler("unban", unban)
-    )
-
-    application.add_handler(
-        CommandHandler("mute", mute)
-    )
-
-    application.add_handler(
-        CommandHandler("unmute", unmute)
-    )
-
-    application.add_handler(
-        CommandHandler("kick", kick)
-    )
-
-    application.add_handler(
-        CommandHandler("purge", purge)
-    )
-
-    application.add_handler(
-        CommandHandler("promote", promote)
-    )
-
-    application.add_handler(
-        CommandHandler("demote", demote)
     )
 
     # --------------------------------------------------------
@@ -2560,67 +2699,91 @@ def main():
     # --------------------------------------------------------
 
     application.add_handler(
-        CommandHandler("rules", rules)
+        CommandHandler(
+            "welcome",
+            welcome_command,
+        )
     )
 
     application.add_handler(
-        CommandHandler("setrules", setrules)
+        CommandHandler(
+            "goodbye",
+            goodbye_command,
+        )
     )
 
     application.add_handler(
-        CommandHandler("welcome", welcome)
+        CommandHandler(
+            "setrules",
+            setrules_command,
+        )
     )
 
     application.add_handler(
-        CommandHandler("goodbye", goodbye)
+        CommandHandler(
+            "warn",
+            warn_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "unwarn",
+            unwarn_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "ban",
+            ban_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "unban",
+            unban_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "mute",
+            mute_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "unmute",
+            unmute_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "purge",
+            purge_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "lock",
+            lock_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "unlock",
+            unlock_command,
+        )
     )
 
     # --------------------------------------------------------
-    # LOCKS
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CommandHandler("lock", lock)
-    )
-
-    application.add_handler(
-        CommandHandler("unlock", unlock)
-    )
-
-    application.add_handler(
-        CommandHandler("locks", locks)
-    )
-
-    # --------------------------------------------------------
-    # FEDERATION
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CommandHandler("newfed", newfed)
-    )
-
-    application.add_handler(
-        CommandHandler("joinfed", joinfed)
-    )
-
-    application.add_handler(
-        CommandHandler("fban", fban)
-    )
-
-    application.add_handler(
-        CommandHandler("funban", funban)
-    )
-
-    application.add_handler(
-        CommandHandler("fmute", fmute)
-    )
-
-    application.add_handler(
-        CommandHandler("funmute", funmute)
-    )
-
-    # --------------------------------------------------------
-    # CALLBACKS
+    # FORCE JOIN CALLBACK
     # --------------------------------------------------------
 
     application.add_handler(
@@ -2632,22 +2795,41 @@ def main():
 
     application.add_handler(
         CallbackQueryHandler(
-            request_again,
-            pattern=r"^request_again$",
+            request_approval,
+            pattern=r"^request_approval$",
         )
     )
 
-    application.add_handler(
-        CallbackQueryHandler(
-            process_approval,
-            pattern=r"^(approve|reject):\d+$",
-        )
-    )
+    # --------------------------------------------------------
+    # APPROVAL CALLBACKS
+    # --------------------------------------------------------
 
     application.add_handler(
         CallbackQueryHandler(
-            no_link,
-            pattern=r"^no_link_\d+$",
+            approval_callback,
+            pattern=r"^(approve|reject|revoke|reapprove):\d+$",
+        )
+    )
+
+    # --------------------------------------------------------
+    # ROSE CALLBACKS
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            rose_callback,
+            pattern=r"^rose_",
+        )
+    )
+
+    # --------------------------------------------------------
+    # PANEL CALLBACKS
+    # --------------------------------------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            panel_callback,
+            pattern=r"^panel_",
         )
     )
 
@@ -2656,43 +2838,31 @@ def main():
     # --------------------------------------------------------
 
     application.add_handler(
-        MessageHandler(
-            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+        ChatMemberHandler(
             new_member,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.StatusUpdate.LEFT_CHAT_MEMBER,
-            left_member,
+            ChatMemberHandler.CHAT_MEMBER,
         )
     )
 
     # --------------------------------------------------------
-    # MESSAGE MODERATION
-    # --------------------------------------------------------
-
-    application.add_handler(
-        MessageHandler(
-            filters.ALL & ~filters.COMMAND,
-            moderation_filter,
-        )
-    )
-
-    # --------------------------------------------------------
-    # ERRORS
+    # ERROR
     # --------------------------------------------------------
 
     application.add_error_handler(
         error_handler
     )
 
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
     print("✅ Bot is running...")
-    print()
+    print("🔐 Force Join: ENABLED")
+    print("👑 Approval System: ENABLED")
+    print("🌹 Rose Menu: ENABLED")
 
     application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+        drop_pending_updates=True
     )
 
 
