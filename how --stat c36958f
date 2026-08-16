@@ -1,0 +1,29 @@
+* [33mba5e084[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mraja-development[m[33m, [m[1;31morigin/raja-development[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;32mmain[m[33m)[m Update .env.example
+* [33mc36958f[m Update bot.py
+* [33m89908ab[m Update .env.example
+*   [33maa7c58e[m Merge: keep local bot code
+[32m|[m[33m\[m  
+[32m|[m * [33m3779643[m Update bot.py
+[32m|[m * [33mddc15ee[m Update bot.py
+[32m|[m * [33mb3d1697[m Update database.py
+[32m|[m * [33me79f548[m Update bot.py
+[32m|[m * [33mfb4b1e8[m Update database.py
+[32m|[m * [33m171b2d5[m Update bot.py
+[32m|[m * [33m2ea4a8b[m Update config.py
+[32m|[m * [33mbb1fbae[m Update bot.py
+[32m|[m * [33m450aa84[m Update config.py
+[32m|[m * [33m907cb47[m Update bot.py
+[32m|[m * [33m29e8fe0[m Update bot.py
+[32m|[m * [33m3d9374d[m Update .env
+[32m|[m * [33me81e281[m Update bot.py
+[32m|[m * [33m34a2ca6[m Implement SQLite database functions for users and channels
+[32m|[m * [33mf1e5b08[m Update config.py
+[32m|[m * [33m642e86d[m Update requirements.txt
+[32m|[m * [33m2d5e4cf[m Create .env
+[32m|[m * [33m8fb73c7[m Create requirements.txt
+[32m|[m * [33ma05c8d4[m Create database.py
+[32m|[m * [33m51ee73d[m Create config.py
+[32m|[m * [33m8bf9bda[m Create  bot.py
+[32m|[m * [33mc466cb8[m Update README.md
+[32m|[m * [33m6f8709e[m Initial commit
+* [33mbbd7687[m initial commit
