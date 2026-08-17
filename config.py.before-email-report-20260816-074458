@@ -34,14 +34,3 @@ if not API_HASH:
 
 if not SESSION_STRING:
     raise RuntimeError("SESSION_STRING is missing in .env")
-
-
-# ============================================================
-# EMAIL REPORTING
-# ============================================================
-
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
-REPORT_FROM_EMAIL = os.getenv("REPORT_FROM_EMAIL", SMTP_USERNAME).strip()

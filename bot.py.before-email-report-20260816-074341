@@ -1608,182 +1608,6 @@ async def report_message(
     )
 
 
-async def report_method_telegram(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-
-    if not query:
-        return
-
-    user = query.from_user
-
-    if not user_has_bot_access(user.id):
-        await query.answer(
-            "❌ Approval required.",
-            show_alert=True,
-        )
-        return
-
-    await query.answer()
-
-    peer = context.user_data.get("report_peer")
-    message_id = context.user_data.get("report_message_id")
-    report_link = context.user_data.get("report_link")
-    reason_key = context.user_data.get("report_reason")
-
-    if peer is None or message_id is None or not report_link:
-        await query.edit_message_text(
-            "❌ <b>Report session expired.</b>\n\n"
-            "Please use /report again.",
-            parse_mode="HTML",
-        )
-        return
-
-    if reason_key not in REPORT_REASONS:
-        await query.edit_message_text(
-            "❌ Invalid report reason."
-        )
-        return
-
-    reason_name = REPORT_REASONS[reason_key]
-
-    await query.edit_message_text(
-        "⏳ <b>Submitting Telegram report...</b>\n\n"
-        f"📌 <b>Reason:</b> {escape(reason_name)}",
-        parse_mode="HTML",
-    )
-
-    try:
-        from pyrogram.raw.functions.messages import Report
-        from pyrogram.raw.types import (
-            InputReportReasonSpam,
-            InputReportReasonViolence,
-            InputReportReasonPornography,
-            InputReportReasonChildAbuse,
-            InputReportReasonIllegalDrugs,
-            InputReportReasonFake,
-            InputReportReasonPersonalDetails,
-            InputReportReasonOther,
-        )
-
-        reason_classes = {
-            "spam": InputReportReasonSpam,
-            "violence": InputReportReasonViolence,
-            "pornography": InputReportReasonPornography,
-            "child_abuse": InputReportReasonChildAbuse,
-            "illegal_drugs": InputReportReasonIllegalDrugs,
-            "fake": InputReportReasonFake,
-            "personal_details": InputReportReasonPersonalDetails,
-            "other": InputReportReasonOther,
-        }
-
-        global REPORT_ASSISTANT
-
-        if REPORT_ASSISTANT is None:
-            await query.edit_message_text(
-                "❌ <b>Telegram assistant is not connected.</b>\n\n"
-                "Please try again after the assistant connects.",
-                parse_mode="HTML",
-            )
-            return
-
-        resolved_peer = await REPORT_ASSISTANT.resolve_peer(peer)
-
-        result = await REPORT_ASSISTANT.invoke(
-            Report(
-                peer=resolved_peer,
-                id=[int(message_id)],
-                reason=reason_classes[reason_key](),
-                message=(
-                    f"User submitted a Telegram report. "
-                    f"Reason: {reason_name}."
-                ),
-            )
-        )
-
-        logger.info(
-            "Telegram report submitted | requester=%s | "
-            "link=%s | reason=%s | result=%s",
-            user.id,
-            report_link,
-            reason_key,
-            result,
-        )
-
-        await query.edit_message_text(
-            "✅ <b>TELEGRAM REPORT SUBMITTED</b>\n\n"
-            f"📌 <b>Reason:</b> {escape(reason_name)}\n"
-            f"🔗 <b>Message:</b>\n{escape(report_link)}\n\n"
-            "Telegram has received the report through its reporting API. "
-            "Any enforcement decision is made by Telegram.",
-            parse_mode="HTML",
-        )
-
-    except Exception as e:
-        logger.exception(
-            "Telegram report failed | requester=%s | link=%s",
-            user.id,
-            report_link,
-        )
-
-        await query.edit_message_text(
-            "❌ <b>REPORT FAILED</b>\n\n"
-            f"📌 <b>Reason:</b> {escape(reason_name)}\n\n"
-            "Telegram did not accept the report request.\n\n"
-            f"<code>{escape(str(e))}</code>",
-            parse_mode="HTML",
-        )
-
-
-async def email_report_placeholder(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-
-    if not query:
-        return
-
-    user = query.from_user
-
-    if not user_has_bot_access(user.id):
-        await query.answer(
-            "❌ Approval required.",
-            show_alert=True,
-        )
-        return
-
-    await query.answer()
-
-    link = context.user_data.get("report_link")
-    reason_key = context.user_data.get("report_reason")
-
-    if not link:
-        await query.edit_message_text(
-            "❌ Report session expired.\n\n"
-            "Please use /report again."
-        )
-        return
-
-    reason_name = REPORT_REASONS.get(
-        reason_key or "other",
-        "Other",
-    )
-
-    await query.edit_message_text(
-        "📧 <b>EMAIL ABUSE REPORT</b>\n\n"
-        f"🔗 <b>Message:</b>\n{escape(link)}\n\n"
-        f"📌 <b>Reason:</b> {escape(reason_name)}\n\n"
-        "🚧 <b>PLACEHOLDER</b>\n\n"
-        "The email-reporting system is not active yet.\n"
-        "No email has been sent.",
-        parse_mode="HTML",
-    )
-
-
-
 async def report_reason_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1838,35 +1662,11 @@ async def report_reason_callback(
 
     reason_name = REPORT_REASONS[reason_key]
 
-    # Save selected reason for the next step.
-    context.user_data["report_reason"] = reason_key
-
-    report_method_keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🚨 Telegram API Report",
-                    callback_data="reportmethod:telegram",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📧 Email Report",
-                    callback_data="email_report:placeholder",
-                )
-            ],
-        ]
-    )
-
     await query.edit_message_text(
-        "🚨 <b>REPORT METHOD</b>\n\n"
-        f"📌 <b>Reason:</b> {escape(reason_name)}\n\n"
-        "Choose how you want to continue:",
+        "⏳ <b>Submitting Telegram report...</b>\n\n"
+        f"📌 Reason: {reason_name}",
         parse_mode="HTML",
-        reply_markup=report_method_keyboard,
     )
-
-    return
 
     try:
         from pyrogram import Client
@@ -2071,27 +1871,6 @@ def main():
         CallbackQueryHandler(
             gateway_placeholder,
             pattern=r"^gateway:",
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            email_report_placeholder,
-            pattern=r"^email_report:",
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            report_method_telegram,
-            pattern=r"^reportmethod:",
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            email_report_placeholder,
-            pattern=r"^email_report:",
         )
     )
 
