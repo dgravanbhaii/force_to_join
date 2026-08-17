@@ -7,3 +7,14 @@ user_groups.json
 credentials.json
 gmail_tokens/
 gmail_oauth/__pycache__/
+
+# OAuth / secrets
+.env
+.env.*
+!.env.example
+credentials.json
+credentials.json.backup
+gmail_tokens/
+gmail_oauth/
+*.session
+*.session-journal
